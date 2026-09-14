@@ -16,223 +16,265 @@
 
 import csv
 import json
-import math
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
-# Ensure benchmarking/locust is in sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import server_telemetry
 
+NO_PERCENTILES = {"min": None, "p50": None, "p90": None,
+                  "p99": None, "max": None, "avg": None}
 
-class ComputePercentilesTest(unittest.TestCase):
-    def test_normal_distribution(self):
-        vals = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
-        res = server_telemetry.compute_percentiles(vals)
-        self.assertEqual(res["min"], 1.0)
-        self.assertEqual(res["max"], 10.0)
-        self.assertEqual(res["p50"], 6.0)
-        self.assertEqual(res["avg"], 5.5)
+# Every harvest test shares this five-second window; only the pod count varies.
+WINDOW = {"prom_url": "http://localhost:9090", "start_ts": 100,
+          "end_ts": 105, "steady_start_ts": 100}
 
-    def test_nan_and_inf_filtering(self):
-        vals = [1.0, float("nan"), 2.0, float("inf"), float("-inf"), 3.0]
-        res = server_telemetry.compute_percentiles(vals)
-        self.assertEqual(res["min"], 1.0)
-        self.assertEqual(res["max"], 3.0)
-        self.assertEqual(res["p50"], 2.0)
-        self.assertEqual(res["avg"], 2.0)
+# packing, CPU PSI, memory PSI, IO PSI, CFS throttling.
+EMPTY_RANGES = [[], [], [], [], []]
 
-    def test_empty_or_all_nan(self):
+
+def harvest(worker_pod_count=5):
+    return server_telemetry.harvest_server_telemetry(
+        worker_pod_count=worker_pod_count, **WINDOW
+    )
+
+
+def snapshot_instants(size_p50, size_p90, c_start="100", c_end="150",
+                      size_p95="0", size_sum_start=None, size_sum_end=None):
+    """The eleven instant queries the snapshot block issues, in order.
+
+    Order matters: these are consumed as a mock side_effect.
+    """
+    return [
+        [{"value": [105, size_p50]}],  # snapshot size p50
+        [{"value": [105, size_p90]}],  # snapshot size p90
+        [{"value": [105, size_p95]}],  # snapshot size p95
+        [{"value": [100, c_start]}],   # checkpoint count at window start
+        [{"value": [105, c_end]}],     # checkpoint count at window end
+        [{"value": [100, size_sum_start]}] if size_sum_start is not None else [],
+        [{"value": [105, size_sum_end]}] if size_sum_end is not None else [],
+        [{"value": [105, "0.08"]}],    # restore p50
+        [{"value": [105, "0.15"]}],    # restore p95
+        [{"value": [105, "0.12"]}],    # checkpoint p50
+        [{"value": [105, "0.22"]}],    # checkpoint p95
+    ]
+
+
+def history_csv(rows):
+    """A stats_history.csv built from (timestamp, user count) pairs."""
+    f = tempfile.NamedTemporaryFile("w", delete=False, suffix=".csv")
+    writer = csv.DictWriter(f, fieldnames=["Timestamp", "Name", "User Count"])
+    writer.writeheader()
+    for ts, users in rows:
+        writer.writerow({"Timestamp": ts, "Name": "Aggregated", "User Count": users})
+    f.close()
+    return Path(f.name)
+
+
+class ServerTelemetryTest(unittest.TestCase):
+    def test_compute_percentiles(self):
+        # 200 distinct samples, so an off-by-one in the indexing shows up.
+        res = server_telemetry.compute_percentiles([float(i) for i in range(1, 201)])
         self.assertEqual(
-            server_telemetry.compute_percentiles([]),
-            {"min": None, "p50": None, "p90": None, "p99": None, "max": None, "avg": None},
+            (res["min"], res["p50"], res["p90"], res["p99"], res["max"], res["avg"]),
+            (1.0, 101.0, 181.0, 199.0, 200.0, 100.5))
+
+        # With a single sample, every percentile is that sample.
+        res = server_telemetry.compute_percentiles([7.5])
+        self.assertEqual((res["p50"], res["p90"], res["p99"]), (7.5, 7.5, 7.5))
+
+        res = server_telemetry.compute_percentiles(
+            [1.0, float("nan"), 2.0, float("inf"), float("-inf"), 3.0]
         )
-        self.assertEqual(
-            server_telemetry.compute_percentiles([float("nan")]),
-            {"min": None, "p50": None, "p90": None, "p99": None, "max": None, "avg": None},
-        )
+        self.assertEqual((res["min"], res["p50"], res["max"], res["avg"]),
+                         (1.0, 2.0, 3.0, 2.0))
 
+        # Nothing left to measure is None, not zero.
+        self.assertEqual(server_telemetry.compute_percentiles([]), NO_PERCENTILES)
+        self.assertEqual(server_telemetry.compute_percentiles([float("nan")]),
+                         NO_PERCENTILES)
 
-class SteadyStateWindowTest(unittest.TestCase):
-    def test_window_detection(self):
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".csv") as f:
-            writer = csv.DictWriter(
-                f, fieldnames=["Timestamp", "Name", "User Count"]
-            )
-            writer.writeheader()
-            writer.writerow({"Timestamp": "100", "Name": "Aggregated", "User Count": "2"})
-            writer.writerow({"Timestamp": "110", "Name": "Aggregated", "User Count": "4"})
-            writer.writerow({"Timestamp": "120", "Name": "Aggregated", "User Count": "7"})
-            writer.writerow({"Timestamp": "130", "Name": "Aggregated", "User Count": "7"})
-            csv_path = Path(f.name)
-
+    def test_steady_state_window(self):
+        # Steady starts at the first sample at or above 90% of target (6.3).
+        path = history_csv([("100", "2"), ("110", "4"), ("120", "7"), ("130", "7")])
         try:
-            start_ts, end_ts = 100, 150
-            steady_start, steady_end = server_telemetry.get_steady_state_window(
-                csv_path, active_users=7, start_ts=start_ts, end_ts=end_ts
+            self.assertEqual(
+                server_telemetry.get_steady_state_window(
+                    path, active_users=7, start_ts=100, end_ts=150),
+                (120, 150),
             )
-            # 7 >= 0.9 * 7 (6.3) at timestamp 120
-            self.assertEqual(steady_start, 120)
-            self.assertEqual(steady_end, 150)
         finally:
-            csv_path.unlink()
+            path.unlink()
 
-    def test_fallback_when_threshold_not_reached(self):
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".csv") as f:
-            writer = csv.DictWriter(
-                f, fieldnames=["Timestamp", "Name", "User Count"]
-            )
-            writer.writeheader()
-            writer.writerow({"Timestamp": "100", "Name": "Aggregated", "User Count": "2"})
-            csv_path = Path(f.name)
-
+        # Target never reached, so the whole run is used rather than nothing.
+        path = history_csv([("100", "2")])
         try:
-            steady_start, steady_end = server_telemetry.get_steady_state_window(
-                csv_path, active_users=10, start_ts=100, end_ts=150
+            self.assertEqual(
+                server_telemetry.get_steady_state_window(
+                    path, active_users=10, start_ts=100, end_ts=150),
+                (100, 150),
             )
-            self.assertEqual(steady_start, 100)
-            self.assertEqual(steady_end, 150)
         finally:
-            csv_path.unlink()
+            path.unlink()
 
-
-class PrometheusQueryTest(unittest.TestCase):
     @mock.patch("urllib.request.urlopen")
-    def test_query_prometheus_range_guard(self, mock_urlopen):
-        mock_resp = mock.MagicMock()
-        mock_resp.read.return_value = json.dumps({
+    def test_range_query_window_guard(self, mock_urlopen):
+        # Prometheus answers 400 when end is not after start, so a zero-length
+        # window is widened by a second. Assert on the URL actually sent.
+        resp = mock.MagicMock()
+        resp.read.return_value = json.dumps({
             "status": "success",
-            "data": {"result": [{"metric": {}, "values": [[100, "1.0"]]}]}
+            "data": {"result": [{"metric": {}, "values": [[100, "1.0"]]}]},
         }).encode("utf-8")
-        mock_urlopen.return_value.__enter__.return_value = mock_resp
+        mock_urlopen.return_value.__enter__.return_value = resp
 
-        # start_ts == end_ts should be automatically guarded to end_ts = start_ts + 1
-        res = server_telemetry.query_prometheus_range("http://localhost:9090", "up", 100, 100)
+        res = server_telemetry.query_prometheus_range(
+            "http://localhost:9090", "up", 100, 100)
+        url = mock_urlopen.call_args[0][0].full_url
+        self.assertIn("start=100", url)
+        self.assertIn("end=101", url)
         self.assertEqual(len(res), 1)
+
+        server_telemetry.query_prometheus_range(
+            "http://localhost:9090", "up", 100, 160)
+        url = mock_urlopen.call_args[0][0].full_url
+        self.assertIn("start=100", url)
+        self.assertIn("end=160", url)
 
     @mock.patch("server_telemetry.query_prometheus_instant")
     def test_quantile_fallback(self, mock_instant):
-        # First call (rate query) returns empty or NaN
-        # Second call (cumulative query) returns valid 11.6 MB
+        # A rate query over a quiet window yields NaN: fall back to cumulative.
         mock_instant.side_effect = [
             [{"value": [100, "NaN"]}],
             [{"value": [100, "11.625"]}],
         ]
         val = server_telemetry._query_quantile_with_fallback(
-            "http://localhost:9090",
-            0.50,
-            "rate(bucket[5m])",
-            "bucket",
-            end_ts=100,
-        )
+            "http://localhost:9090", 0.50, "rate(bucket[5m])", "bucket", end_ts=100)
         self.assertEqual(val, 11.625)
-        self.assertEqual(mock_instant.call_count, 2)
 
+        # A malformed response costs one field, it must not raise.
+        for bad in ([{"value": None}], [{"value": []}], [{"value": [100, None]}]):
+            self.assertIsNone(server_telemetry._parse_instant_float(bad))
 
-class HarvestServerTelemetryTest(unittest.TestCase):
     @mock.patch("server_telemetry.query_prometheus_range")
     @mock.patch("server_telemetry.query_prometheus_instant")
-    def test_harvest_packing_math(self, mock_instant, mock_range):
-        # Mock packing timeseries: assigned=4 with worker_pod_count=5
-        mock_range.side_effect = [
-            # Packing query
-            [
-                {
-                    "metric": {"ate_worker_state": "assigned"},
-                    "values": [[100, "4.0"], [105, "4.0"]],
-                }
-            ],
-            # CPU PSI
-            [{"values": [[100, "1.5"], [105, "1.8"]]}],
-            # Memory PSI
-            [{"values": [[100, "0.0"], [105, "0.0"]]}],
-            # IO PSI
-            [{"values": [[100, "0.0"], [105, "0.0"]]}],
-            # CFS Throttled
-            [{"values": [[100, "0.01"], [105, "0.02"]]}],
-        ]
+    def test_packing_and_checkpoint_math(self, mock_instant, mock_range):
+        # The Inf sample must be dropped: json.dumps would write a bare
+        # Infinity that strict parsers reject.
+        assigned = {"metric": {"ate_worker_state": "assigned"},
+                    "values": [[100, "4.0"], [105, "4.0"], [110, "Inf"]]}
+        quiet = [{"values": [[100, "0.0"], [105, "0.0"]]}]
+        mock_range.side_effect = [[assigned], quiet, quiet, quiet, quiet]
+        mock_instant.side_effect = snapshot_instants("11.5", "12.0")
 
-        # Instant queries: snap size, count start, count end, restore p50, restore p95, ckpt p50, ckpt p95
-        mock_instant.side_effect = [
-            [{"value": [105, "11.5"]}],  # snap size p50
-            [{"value": [105, "12.0"]}],  # snap size p90
-            [{"value": [100, "100"]}],   # count start
-            [{"value": [105, "150"]}],   # count end
-            [{"value": [105, "0.08"]}],  # restore p50
-            [{"value": [105, "0.15"]}],  # restore p95
-            [{"value": [105, "0.12"]}],  # ckpt p50
-            [{"value": [105, "0.22"]}],  # ckpt p95
-        ]
-
-        summary = server_telemetry.harvest_server_telemetry(
-            prom_url="http://localhost:9090",
-            start_ts=100,
-            end_ts=105,
-            steady_start_ts=100,
-            worker_pod_count=5,
-        )
+        summary = harvest(worker_pod_count=5)
 
         packing = summary["cluster_packing"]
-        # 4 assigned / 5 total worker pods = 0.80
-        self.assertEqual(packing["summary"]["p50"], 0.8)
-        self.assertEqual(packing["timeseries"][0]["packing_ratio"], 0.8)
+        self.assertEqual(packing["summary"]["p50"], 0.8)  # 4 assigned / 5 pods
         self.assertEqual(packing["timeseries"][0]["total_workers"], 5.0)
+        self.assertEqual(len(packing["timeseries"]), 2)   # the Inf point is gone
+        self.assertNotIn("Infinity", json.dumps(summary))
 
         snapshots = summary["snapshots"]
-        self.assertEqual(snapshots["checkpoints_in_window"], 50)
+        self.assertEqual(snapshots["checkpoints_in_window"], 50)  # 150 - 100
         self.assertEqual(snapshots["checkpoints_cumulative"], 150)
-        self.assertEqual(snapshots["size_p50_mb"], 11.5)
-        self.assertIsNotNone(snapshots["throughput_mb_s"])
 
     @mock.patch("server_telemetry.query_prometheus_range")
     @mock.patch("server_telemetry.query_prometheus_instant")
-    def test_unknown_pod_count_uses_prometheus_total(
-        self, mock_instant, mock_range
-    ):
-        """An unknown pod count must fall back to what Prometheus reports.
-
-        cluster_facts deliberately returns None rather than assuming a worker
-        count, because Prometheus already knows the real number. If a guess is
-        ever reintroduced upstream it would pre-empt this branch, so the
-        denominator is asserted explicitly.
-        """
+    def test_unknown_pod_count_uses_observed_workers(self, mock_instant, mock_range):
+        # cluster_facts returns None rather than guessing, so the denominator
+        # is what Prometheus reports.
         mock_range.side_effect = [
-            # Packing query: 4 assigned out of 20 workers actually reporting.
             [
-                {
-                    "metric": {"ate_worker_state": "assigned"},
-                    "values": [[100, "4.0"]],
-                },
-                {
-                    "metric": {"ate_worker_state": "idle"},
-                    "values": [[100, "16.0"]],
-                },
+                {"metric": {"ate_worker_state": "assigned"},
+                 "values": [[100, "4.0"]]},
+                {"metric": {"ate_worker_state": "idle"},
+                 "values": [[100, "16.0"]]},
             ],
-            [{"values": [[100, "0.0"]]}],  # CPU PSI
-            [{"values": [[100, "0.0"]]}],  # Memory PSI
-            [{"values": [[100, "0.0"]]}],  # IO PSI
-            [{"values": [[100, "0.0"]]}],  # CFS throttled
+            [{"values": [[100, "0.0"]]}], [{"values": [[100, "0.0"]]}],
+            [{"values": [[100, "0.0"]]}], [{"values": [[100, "0.0"]]}],
         ]
-        # Snapshot queries are irrelevant here, and each empty quantile costs
-        # a second call via the fallback, so the count is not fixed.
         mock_instant.return_value = []
 
-        summary = server_telemetry.harvest_server_telemetry(
-            prom_url="http://localhost:9090",
-            start_ts=100,
-            end_ts=105,
-            steady_start_ts=100,
-            worker_pod_count=None,
-        )
-
-        point = summary["cluster_packing"]["timeseries"][0]
-        # 4 + 16 observed workers, not a fabricated node count and not 1.0.
-        self.assertEqual(point["total_workers"], 20.0)
+        point = harvest(worker_pod_count=None)["cluster_packing"]["timeseries"][0]
+        self.assertEqual(point["total_workers"], 20.0)  # 4 + 16 observed
         self.assertEqual(point["packing_ratio"], 0.2)
+
+    @mock.patch("server_telemetry.query_prometheus_range")
+    @mock.patch("server_telemetry.query_prometheus_instant")
+    def test_snapshot_fields_are_null_not_zero(self, mock_instant, mock_range):
+        # "no checkpoints happened" and "we could not find out" must differ.
+        mock_range.side_effect = EMPTY_RANGES
+        mock_instant.return_value = []
+        snaps = harvest()["snapshots"]
+        self.assertIsNone(snaps["checkpoints_in_window"])
+        self.assertIsNone(snaps["checkpoints_cumulative"])
+        self.assertIsNone(snaps["throughput_mb_s"])
+        self.assertIsNone(snaps["size_p95_mb"])
+        self.assertIsNone(snaps["size_avg_mb"])
+
+        # A 0.0 median is falsy but real, and must still produce throughput.
+        mock_range.side_effect = EMPTY_RANGES
+        mock_instant.side_effect = snapshot_instants("0.0", "0.0")
+        snaps = harvest()["snapshots"]
+        self.assertEqual(snaps["size_p50_mb"], 0.0)
+        self.assertEqual(snaps["checkpoints_in_window"], 50)
+        self.assertEqual(snaps["throughput_mb_s"], 0.0)
+
+        # Counter went backwards, so an atelet restarted and the delta is
+        # unknowable. 0 would read as "nothing was checkpointed".
+        mock_range.side_effect = EMPTY_RANGES
+        mock_instant.side_effect = snapshot_instants("1.0", "1.0",
+                                                     c_start="900", c_end="150")
+        snaps = harvest()["snapshots"]
+        self.assertIsNone(snaps["checkpoints_in_window"])
+        self.assertIsNone(snaps["throughput_mb_s"])
+        self.assertEqual(snaps["checkpoints_cumulative"], 150)
+
+        # Windowed delta over windowed count: 100 MiB across 50 checkpoints is
+        # 2.0 MB. A lifetime mean would read 400/150 = 2.667 instead.
+        mock_range.side_effect = EMPTY_RANGES
+        mock_instant.side_effect = snapshot_instants(
+            "1.0", "1.5", size_p95="1.75",
+            size_sum_start=str(300 * 1024 * 1024),
+            size_sum_end=str(400 * 1024 * 1024),
+        )
+        snaps = harvest()["snapshots"]
+        self.assertEqual(snaps["size_p95_mb"], 1.75)
+        self.assertEqual(snaps["size_avg_mb"], 2.0)
+
+        # The mock replies by position, so only the query text proves p95 was
+        # asked for. restore_p95 also uses 0.95, hence the metric name too.
+        queries = [c.args[1] for c in mock_instant.call_args_list]
+        self.assertTrue(any("histogram_quantile(0.95" in q
+                            and "atelet_snapshot_size_bytes" in q
+                            for q in queries))
+
+        # Likewise time_ts, or both sum endpoints could read the same instant.
+        sum_times = {c.kwargs.get("time_ts") for c in mock_instant.call_args_list
+                     if c.args[1] == "sum(atelet_snapshot_size_bytes_sum)"}
+        self.assertEqual(len(sum_times), 2)
+
+        # Sum went backwards even though the counts rose, so a restart again.
+        mock_range.side_effect = EMPTY_RANGES
+        mock_instant.side_effect = snapshot_instants(
+            "1.0", "1.0",
+            size_sum_start=str(400 * 1024 * 1024),
+            size_sum_end=str(300 * 1024 * 1024),
+        )
+        self.assertIsNone(harvest()["snapshots"]["size_avg_mb"])
+
+        # A zero count means nothing was snapshotted: unknown, not 0 MB.
+        mock_range.side_effect = EMPTY_RANGES
+        mock_instant.side_effect = snapshot_instants(
+            "1.0", "1.0", c_start="0", c_end="0",
+            size_sum_start="0", size_sum_end="0",
+        )
+        self.assertIsNone(harvest()["snapshots"]["size_avg_mb"])
 
 
 if __name__ == "__main__":

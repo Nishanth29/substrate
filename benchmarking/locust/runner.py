@@ -59,6 +59,10 @@ BOOMER_BINARY = "/app/boomer-worker"
 # holds 5557 (master) and 8089 (web UI) in this container.
 BOOMER_CONFIG_PORT = 5560
 
+# In-cluster Prometheus that benchmarking/monitoring.yaml deploys. Override
+# with --prometheus-url, for example when port-forwarding to a local run.
+DEFAULT_PROMETHEUS_URL = "http://prometheus.benchmarking.svc.cluster.local:9090"
+
 # Tab-separated columns written to traces.txt. Order matters — readers split
 # on \t and index positionally.
 TRACE_COLUMNS = ("time", "name", "duration_ms", "latency_source", "trace_id", "err")
@@ -108,6 +112,15 @@ def parse_args() -> argparse.Namespace:
             "after the run to derive density frontiers. Pass "
             "--no-cluster-facts to skip those API calls, for example on a "
             "large cluster where listing nodes is expensive"
+        ),
+    )
+    p.add_argument(
+        "--prometheus-url",
+        default=DEFAULT_PROMETHEUS_URL,
+        help=(
+            "Prometheus to harvest server-side telemetry from after the run. "
+            "An unreachable Prometheus is not an error: the affected fields "
+            "are recorded as null"
         ),
     )
     args, extra = p.parse_known_args()
@@ -499,15 +512,11 @@ def main() -> None:
                 tee(logs, f"Warning: Failed to record cluster facts: {e}")
 
             # Harvest server-side ground truth from Prometheus (bin-packing, PSI, snapshots)
-            prom_url = os.environ.get(
-                "PROMETHEUS_URL",
-                "http://prometheus.benchmarking.svc.cluster.local:9090",
-            )
             try:
                 from server_telemetry import extract_and_record_server_telemetry
 
                 extract_and_record_server_telemetry(
-                    prom_url=prom_url,
+                    prom_url=args.prometheus_url,
                     start_ts=run_ts,
                     end_ts=run_end_ts,
                     stats_history_csv=stats_history_csv,

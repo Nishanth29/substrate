@@ -77,10 +77,16 @@ def _count_worker_pods(v1: client.CoreV1Api, logs: TextIO | None = None) -> int 
     """Counts live pods in the worker pool.
 
     Prefers the dedicated worker namespace and falls back to a cluster-wide
-    lookup for clusters that place the pool elsewhere. Both listings are
-    filtered server-side by label so the apiserver never streams us the full
-    pod inventory.
+    lookup for clusters that place the pool elsewhere. Listing a namespace that
+    does not exist returns an empty list rather than an error, so an empty
+    result is what "the pool is somewhere else" looks like and it has to
+    trigger the fallback.
+
+    Both listings are filtered server-side by label and served from the watch
+    cache, but the cluster-wide one still scans every pod, so it is logged
+    whenever it happens. Use --no-cluster-facts to skip discovery entirely.
     """
+    namespaced_failed = False
     try:
         pods = v1.list_namespaced_pod(
             namespace=WORKER_POOL_NAMESPACE,
@@ -91,13 +97,24 @@ def _count_worker_pods(v1: client.CoreV1Api, logs: TextIO | None = None) -> int 
     except ApiException as e:
         _log(logs, f"Notice: could not list pods in {WORKER_POOL_NAMESPACE}: {e.reason}")
         pods = []
+        namespaced_failed = True
 
     if not pods:
-        pods = v1.list_pod_for_all_namespaces(
-            label_selector=WORKER_POOL_LABEL,
-            resource_version="0",
-            _request_timeout=API_TIMEOUT_SECONDS,
-        ).items
+        reason = (
+            "the namespaced lookup failed"
+            if namespaced_failed
+            else f"no {WORKER_POOL_LABEL} pods in {WORKER_POOL_NAMESPACE}"
+        )
+        _log(logs, f"Notice: {reason}; scanning all namespaces for the worker pool")
+        try:
+            pods = v1.list_pod_for_all_namespaces(
+                label_selector=WORKER_POOL_LABEL,
+                resource_version="0",
+                _request_timeout=API_TIMEOUT_SECONDS,
+            ).items
+        except ApiException as e:
+            _log(logs, f"Notice: cluster-wide pod lookup failed: {e.reason}")
+            return None
 
     live = [p for p in pods if p.status.phase in LIVE_POD_PHASES]
     return len(live) or None
@@ -136,10 +153,11 @@ def get_cluster_hardware_facts(logs: TextIO | None = None) -> dict[str, Any]:
                 machine_types.add(machine_type)
         facts["node_count"] = len(nodes)
         facts["allocatable_cores"] = round(total_cores, 2)
+        # GiB, as the apiserver and kubectl quote it. Named _gb for continuity
+        # with rows already collected; renaming would break consumers.
         facts["allocatable_ram_gb"] = round(total_ram_bytes / (1024**3), 2)
-        # Recorded so results stay comparable across hardware changes. A
-        # heterogeneous pool is reported as a sorted comma-joined list rather
-        # than picking one node arbitrarily.
+        # Kept so results stay comparable across hardware changes. A mixed pool
+        # is a sorted comma-joined list rather than one node picked at random.
         facts["machine_type"] = ",".join(sorted(machine_types)) or None
     except Exception as e:
         _log(logs, f"Notice: could not read node capacity: {e}")
@@ -162,7 +180,8 @@ def append_trial_summary(
     logs: TextIO | None = None,
 ) -> None:
     active_users = args.users
-    machine_type = facts.get("machine_type")
+    # Only the facts the frontier math divides by. machine_type is recorded
+    # but never computed with, so it goes straight into raw_configuration.
     node_count = facts.get("node_count")
     cores = facts.get("allocatable_cores")
     ram_gb = facts.get("allocatable_ram_gb")
@@ -172,52 +191,37 @@ def append_trial_summary(
     actors_per_vcpu = round(active_users / cores, 2) if cores else None
     actors_per_gb_ram = round(active_users / ram_gb, 2) if ram_gb else None
 
-    # Calculate steady-state A/P percentiles from stats_history.csv
+    # A/P bin-packing percentiles over the steady-state samples. None when
+    # unmeasurable: a ratio derived from configured user count is not a reading.
     ap_p50, ap_p90, ap_p99 = None, None, None
     if stats_history_csv.exists() and pod_count and pod_count > 0:
         try:
-            user_counts: list[float] = []
+            observed: list[float] = []
             with open(stats_history_csv) as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    name = row.get("Name", "")
-                    if name in ("", "Aggregated", "Total") and "User Count" in row:
-                        try:
-                            u = float(row["User Count"])
-                            # Steady-state window: when load reaches configured users
-                            if u >= active_users * 0.9:
-                                user_counts.append(u)
-                        except ValueError:
-                            pass
-            if not user_counts:
-                # Fallback: if no rows matched threshold, use non-zero samples
-                with open(stats_history_csv) as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        name = row.get("Name", "")
-                        if name in ("", "Aggregated", "Total") and "User Count" in row:
-                            try:
-                                u = float(row["User Count"])
-                                if u > 0:
-                                    user_counts.append(u)
-                            except ValueError:
-                                pass
-            if user_counts:
-                ratios = sorted([round(u / pod_count, 4) for u in user_counts])
+                for row in csv.DictReader(f):
+                    if row.get("Name", "") not in ("", "Aggregated", "Total"):
+                        continue
+                    try:
+                        u = float(row.get("User Count", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if u > 0:
+                        observed.append(u)
+            # Steady state is every sample at or above 90% of the target. A run
+            # that never got there falls back to every non-zero sample.
+            steady = [u for u in observed if u >= active_users * 0.9] or observed
+            if steady:
+                ratios = sorted(round(u / pod_count, 4) for u in steady)
                 n = len(ratios)
                 ap_p50 = round(ratios[int(n * 0.50)], 2)
                 ap_p90 = round(ratios[min(int(n * 0.90), n - 1)], 2)
                 ap_p99 = round(ratios[min(int(n * 0.99), n - 1)], 2)
-            else:
-                static_ratio = round(active_users / pod_count, 2)
-                ap_p50, ap_p90, ap_p99 = static_ratio, static_ratio, static_ratio
         except Exception as e:
-            if logs:
-                _log(logs, f"Notice: Error calculating A/P ratio percentiles: {e}")
+            _log(logs, f"Notice: Error calculating A/P ratio percentiles: {e}")
 
-    # Calculate aggregate failure ratio from stats_csv
     total_requests = 0
     total_failures = 0
+    stats_parsed = False
     if stats_csv.exists():
         try:
             with open(stats_csv) as f:
@@ -232,25 +236,27 @@ def append_trial_summary(
                         break
                     total_requests += reqs
                     total_failures += fails
-        except Exception:
-            pass
+            stats_parsed = True
+        except Exception as e:
+            _log(logs, f"Notice: could not parse {stats_csv}: {e}")
+    else:
+        _log(logs, f"Notice: {stats_csv} not found; failure ratio unknown")
 
-    failure_ratio = (
-        round(total_failures / total_requests, 4) if total_requests > 0 else 0.0
-    )
+    # None, not 0.0, when undetermined. A run with zero failures is a real
+    # result and must not look like one where the stats file was unreadable.
+    if stats_parsed and total_requests > 0:
+        failure_ratio = round(total_failures / total_requests, 4)
+    else:
+        failure_ratio = None
 
     summary_entry = {
         "timestamp": data_ts,
         "tag": args.tag,
         "test_name": args.name,
         "metric": "trial_summary",
-        "raw_configuration": {
-            "machine_type": machine_type,
-            "node_count": node_count,
-            "allocatable_cores": cores,
-            "allocatable_ram_gb": ram_gb,
-            "worker_pod_count": pod_count,
-        },
+        # Keyed off EMPTY_FACTS so the raw block always carries every fact,
+        # present or not, and the names are declared in one place.
+        "raw_configuration": {k: facts.get(k) for k in EMPTY_FACTS},
         "frontiers": {
             "actors_per_node": actors_per_node,
             "actors_per_vcpu": actors_per_vcpu,
@@ -263,5 +269,4 @@ def append_trial_summary(
     }
     with open(jsonl_path, "a") as f:
         f.write(json.dumps(summary_entry) + "\n")
-    if logs:
-        _log(logs, f"Appended trial_summary to {jsonl_path}")
+    _log(logs, f"Appended trial_summary to {jsonl_path}")

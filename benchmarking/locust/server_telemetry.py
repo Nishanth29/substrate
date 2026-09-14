@@ -21,7 +21,6 @@ to capture dynamic cluster packing, node PSI stalls, and snapshot throughput.
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
@@ -153,14 +152,23 @@ def _parse_instant_float(res: list[dict[str, Any]]) -> float | None:
         try:
             v = float(res[0]["value"][1])
             return None if math.isnan(v) or math.isinf(v) else round(v, 4)
-        except (ValueError, IndexError):
+        except (KeyError, IndexError, TypeError, ValueError):
+            # Every caller treats None as "no reading". A bad response shape
+            # must cost this one field, not the whole server_summary.json.
             pass
     return None
 
 
-def _parse_instant_int(res: list[dict[str, Any]]) -> int:
+def _parse_instant_int(res: list[dict[str, Any]]) -> int | None:
+    """Returns None, not 0, when the query yielded nothing.
+
+    Prometheus is optional, so an unreachable server is an expected outcome.
+    Zero is a legitimate reading here, so returning it on failure would leave
+    a consumer unable to tell "no checkpoints happened" from "we never found
+    out". Mirrors _parse_instant_float.
+    """
     val = _parse_instant_float(res)
-    return int(val) if val is not None else 0
+    return int(val) if val is not None else None
 
 
 def _query_quantile_with_fallback(
@@ -172,23 +180,24 @@ def _query_quantile_with_fallback(
     unit_scale: float = 1.0,
 ) -> float | None:
     """Queries histogram quantile using rate(5m), falling back to cumulative buckets if NaN/empty."""
+    # _parse_instant_float maps NaN and Inf to None, so None is the only
+    # "no reading" value either query can produce.
     q_rate = (
         f"histogram_quantile({quantile}, sum({rate_metric_expr}) by (le)) / {unit_scale}"
     )
-    res = query_prometheus_instant(prom_url, q_rate, time_ts=end_ts)
-    val = _parse_instant_float(res)
-    if val is not None and not math.isnan(val):
+    val = _parse_instant_float(
+        query_prometheus_instant(prom_url, q_rate, time_ts=end_ts)
+    )
+    if val is not None:
         return val
 
     # Fallback to cumulative bucket distribution
     q_cum = (
         f"histogram_quantile({quantile}, sum by (le) ({raw_metric_expr})) / {unit_scale}"
     )
-    res_cum = query_prometheus_instant(prom_url, q_cum, time_ts=end_ts)
-    val_cum = _parse_instant_float(res_cum)
-    if val_cum is not None and not math.isnan(val_cum):
-        return val_cum
-    return None
+    return _parse_instant_float(
+        query_prometheus_instant(prom_url, q_cum, time_ts=end_ts)
+    )
 
 
 def harvest_server_telemetry(
@@ -221,7 +230,9 @@ def harvest_server_telemetry(
             try:
                 t = int(pt[0])
                 val = float(pt[1])
-                if not math.isnan(val):
+                # Inf as well as NaN: these reach server_summary.json, and
+                # json.dumps would emit a bare Infinity that strict parsers reject.
+                if not math.isnan(val) and not math.isinf(val):
                     ts_packing_map.setdefault(t, {})[state] = val
             except (ValueError, IndexError):
                 continue
@@ -231,15 +242,14 @@ def harvest_server_telemetry(
     for t in sorted(ts_packing_map.keys()):
         states = ts_packing_map[t]
         assigned = states.get("assigned", 0.0)
-        # Prefer the real cluster worker pod count as the physical capacity
-        # denominator. When it is unknown, fall back to the worker states
-        # Prometheus itself reports rather than assuming a number.
+        # Real worker pod count is the physical denominator; when unknown, use
+        # the worker states Prometheus reports rather than assuming a number.
         total = (
             float(worker_pod_count)
             if worker_pod_count
             else (sum(states.values()) or 1.0)
         )
-        ratio = round(assigned / total, 4) if total > 0 else 0.0
+        ratio = round(assigned / total, 4)
         packing_points.append({
             "timestamp": t,
             "assigned_workers": assigned,
@@ -255,30 +265,33 @@ def harvest_server_telemetry(
     }
 
     # 2. Host Linux Kernel PSI Stalls & CFS Throttling
-    psi_cpu_query = (
-        'sum by (instance) (rate(container_pressure_cpu_waiting_seconds_total'
-        '{container="node"}[1m])) * 100'
-    )
-    psi_mem_query = (
-        'sum by (instance) (rate(container_pressure_memory_waiting_seconds_total'
-        '{container="node"}[1m])) * 100'
-    )
-    psi_io_query = (
-        'sum by (instance) (rate(container_pressure_io_waiting_seconds_total'
-        '{container="node"}[1m])) * 100'
-    )
+    #
+    # _waiting_ is PSI "some" (at least one task stalled); cAdvisor also
+    # exports _stalled_, PSI "full" (all tasks stalled). "some" is the earlier
+    # warning signal and the CPU full-stall series carries none, so one series
+    # keeps the three comparable. Both are scraped, so "full" stays available.
+    def psi_query(resource: str) -> str:
+        return (
+            f'sum by (instance) (rate(container_pressure_{resource}_waiting_seconds_total'
+            '{container="node"}[1m])) * 100'
+        )
+
+    # container!="" drops the per-pod rollups cAdvisor reports alongside each
+    # container, which would double count. Unlike the memory and CPU series
+    # these are not dropped at scrape time (see monitoring.yaml).
     cfs_throttled_query = (
-        'sum(rate(container_cpu_cfs_throttled_seconds_total[1m]))'
+        'sum(rate(container_cpu_cfs_throttled_seconds_total'
+        '{container!=""}[1m]))'
     )
 
     psi_cpu_res = query_prometheus_range(
-        prom_url, psi_cpu_query, start_ts, end_ts, step="5s"
+        prom_url, psi_query("cpu"), start_ts, end_ts, step="5s"
     )
     psi_mem_res = query_prometheus_range(
-        prom_url, psi_mem_query, start_ts, end_ts, step="5s"
+        prom_url, psi_query("memory"), start_ts, end_ts, step="5s"
     )
     psi_io_res = query_prometheus_range(
-        prom_url, psi_io_query, start_ts, end_ts, step="5s"
+        prom_url, psi_query("io"), start_ts, end_ts, step="5s"
     )
     cfs_res = query_prometheus_range(
         prom_url, cfs_throttled_query, start_ts, end_ts, step="5s"
@@ -291,6 +304,8 @@ def harvest_server_telemetry(
                 try:
                     if int(pt[0]) >= steady_start_ts:
                         v = float(pt[1])
+                        # Inf needs no filter here: compute_percentiles is the
+                        # only consumer and it drops both NaN and Inf.
                         if not math.isnan(v):
                             vals.append(v)
                 except (ValueError, IndexError):
@@ -305,67 +320,88 @@ def harvest_server_telemetry(
     }
 
     # 3. Snapshot Sizes, Checkpoint Count & Latencies (with histogram fallback)
+    snap_bucket = "atelet_snapshot_size_bytes_bucket"
+    snap_rate = f"rate({snap_bucket}[5m])"
     snap_p50 = _query_quantile_with_fallback(
-        prom_url,
-        0.50,
-        "rate(atelet_snapshot_size_bytes_bucket[5m])",
-        "atelet_snapshot_size_bytes_bucket",
-        end_ts,
-        unit_scale=1024 * 1024,
+        prom_url, 0.50, snap_rate, snap_bucket, end_ts, unit_scale=1024 * 1024
     )
     snap_p90 = _query_quantile_with_fallback(
-        prom_url,
-        0.90,
-        "rate(atelet_snapshot_size_bytes_bucket[5m])",
-        "atelet_snapshot_size_bytes_bucket",
-        end_ts,
-        unit_scale=1024 * 1024,
+        prom_url, 0.90, snap_rate, snap_bucket, end_ts, unit_scale=1024 * 1024
+    )
+    snap_p95 = _query_quantile_with_fallback(
+        prom_url, 0.95, snap_rate, snap_bucket, end_ts, unit_scale=1024 * 1024
     )
 
-    # Delta of snapshots created in steady window
+    snap_count_query = "sum(atelet_snapshot_size_bytes_count)"
     snap_count_start = query_prometheus_instant(
-        prom_url, "sum(atelet_snapshot_size_bytes_count)", time_ts=steady_start_ts
+        prom_url, snap_count_query, time_ts=steady_start_ts
     )
     snap_count_end = query_prometheus_instant(
-        prom_url, "sum(atelet_snapshot_size_bytes_count)", time_ts=end_ts
+        prom_url, snap_count_query, time_ts=end_ts
     )
     c_start = _parse_instant_int(snap_count_start)
     c_end = _parse_instant_int(snap_count_end)
-    window_checkpoints = max(0, c_end - c_start)
 
-    # RPC durations with fallback
+    # A missing endpoint, or a counter that went backwards because an atelet
+    # restarted, makes the delta unknown. 0 would read as "nothing happened".
+    if c_start is None or c_end is None or c_end < c_start:
+        window_checkpoints = None
+    else:
+        window_checkpoints = c_end - c_start
+
+    # Mean over the same window as the percentiles above, from the histogram's
+    # own _sum/_count so it is exact rather than bucket interpolated. _sum
+    # counts up from atelet start, so the end value alone would average the
+    # whole lifetime, not the test.
+    snap_sum_query = "sum(atelet_snapshot_size_bytes_sum)"
+    s_start = _parse_instant_float(
+        query_prometheus_instant(prom_url, snap_sum_query, time_ts=steady_start_ts)
+    )
+    s_end = _parse_instant_float(
+        query_prometheus_instant(prom_url, snap_sum_query, time_ts=end_ts)
+    )
+    snap_avg = None
+    if (
+        s_start is not None
+        and s_end is not None
+        and s_end >= s_start
+        and window_checkpoints
+    ):
+        snap_avg = round((s_end - s_start) / window_checkpoints / (1024 * 1024), 4)
+
+    def rpc_bucket(method: str) -> str:
+        return (
+            'rpc_server_call_duration_seconds_bucket'
+            f'{{rpc_method="atelet.AteomHerder/{method}"}}'
+        )
+
+    restore_bucket = rpc_bucket("Restore")
+    restore_rate = f"rate({restore_bucket}[5m])"
+    ckpt_bucket = rpc_bucket("Checkpoint")
+    ckpt_rate = f"rate({ckpt_bucket}[5m])"
+
     restore_p50 = _query_quantile_with_fallback(
-        prom_url,
-        0.50,
-        'rate(rpc_server_call_duration_seconds_bucket{rpc_method="atelet.AteomHerder/Restore"}[5m])',
-        'rpc_server_call_duration_seconds_bucket{rpc_method="atelet.AteomHerder/Restore"}',
-        end_ts,
+        prom_url, 0.50, restore_rate, restore_bucket, end_ts
     )
     restore_p95 = _query_quantile_with_fallback(
-        prom_url,
-        0.95,
-        'rate(rpc_server_call_duration_seconds_bucket{rpc_method="atelet.AteomHerder/Restore"}[5m])',
-        'rpc_server_call_duration_seconds_bucket{rpc_method="atelet.AteomHerder/Restore"}',
-        end_ts,
+        prom_url, 0.95, restore_rate, restore_bucket, end_ts
     )
     ckpt_p50 = _query_quantile_with_fallback(
-        prom_url,
-        0.50,
-        'rate(rpc_server_call_duration_seconds_bucket{rpc_method="atelet.AteomHerder/Checkpoint"}[5m])',
-        'rpc_server_call_duration_seconds_bucket{rpc_method="atelet.AteomHerder/Checkpoint"}',
-        end_ts,
+        prom_url, 0.50, ckpt_rate, ckpt_bucket, end_ts
     )
     ckpt_p95 = _query_quantile_with_fallback(
-        prom_url,
-        0.95,
-        'rate(rpc_server_call_duration_seconds_bucket{rpc_method="atelet.AteomHerder/Checkpoint"}[5m])',
-        'rpc_server_call_duration_seconds_bucket{rpc_method="atelet.AteomHerder/Checkpoint"}',
-        end_ts,
+        prom_url, 0.95, ckpt_rate, ckpt_bucket, end_ts
     )
 
     steady_duration_s = max(1, end_ts - steady_start_ts)
     throughput_mb_s = None
-    if snap_p50 and window_checkpoints > 0:
+    # `is not None`, not truthiness: a genuine 0.0 median or 0 checkpoints is a
+    # reading, not a missing value, and must not be mistaken for an absent one.
+    if (
+        snap_p50 is not None
+        and window_checkpoints is not None
+        and window_checkpoints > 0
+    ):
         throughput_mb_s = round(
             (snap_p50 * window_checkpoints) / steady_duration_s, 2
         )
@@ -373,6 +409,8 @@ def harvest_server_telemetry(
     summary["snapshots"] = {
         "size_p50_mb": snap_p50,
         "size_p90_mb": snap_p90,
+        "size_p95_mb": snap_p95,
+        "size_avg_mb": snap_avg,
         "checkpoints_in_window": window_checkpoints,
         "checkpoints_cumulative": c_end,
         "restore_p50_s": restore_p50,
