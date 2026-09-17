@@ -49,6 +49,7 @@ from cluster_facts import (
     get_cluster_hardware_facts,
 )
 from common.boomer_config import build_config_json
+from server_telemetry import extract_and_record_server_telemetry
 
 # Path inside the locust image to the boomer-worker binary baked in by
 # benchmarking/locust/Dockerfile.
@@ -110,8 +111,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Read node capacity and worker pod count from the Kubernetes API "
             "after the run to derive density frontiers. Pass "
-            "--no-cluster-facts to skip those API calls, for example on a "
-            "large cluster where listing nodes is expensive"
+            "--no-cluster-facts to skip Kubernetes API discovery"
         ),
     )
     p.add_argument(
@@ -422,11 +422,7 @@ def upload(src: Path, dest: str) -> None:
 def collect_cluster_facts(
     args: argparse.Namespace, logs: TextIO
 ) -> dict[str, Any]:
-    """Returns cluster hardware facts, or empty facts when discovery is off.
-
-    --no-cluster-facts short-circuits before any Kubernetes API call, for
-    clusters where listing nodes and pods is expensive.
-    """
+    """Returns cluster hardware facts, or empty facts when discovery is off."""
     if not args.cluster_facts:
         tee(logs, "Skipping cluster hardware discovery (--no-cluster-facts)")
         return dict(EMPTY_FACTS)
@@ -492,13 +488,18 @@ def main() -> None:
         # Density frontiers and server-side telemetry are additive. They are
         # kept out of the block above so that a failure here cannot discard
         # the measurements the trial actually came for.
+        stats_history_csv = work_dir / f"{args.name}_stats_history.csv"
+        # Seeded up front so that a later failure still leaves a usable
+        # value for the telemetry call below.
+        facts = dict(EMPTY_FACTS)
+        try:
+            facts = collect_cluster_facts(args, logs)
+        except Exception as e:
+            tee(logs, f"Warning: Failed to read cluster facts: {e}")
+
+        # The frontiers divide by user counts, so they need the CSV.
         if stats_generated:
-            stats_history_csv = work_dir / f"{args.name}_stats_history.csv"
-            # Seeded up front so that a later failure still leaves a usable
-            # value for the telemetry call below.
-            facts = dict(EMPTY_FACTS)
             try:
-                facts = collect_cluster_facts(args, logs)
                 append_trial_summary(
                     jsonl_path,
                     stats_csv,
@@ -511,26 +512,25 @@ def main() -> None:
             except Exception as e:
                 tee(logs, f"Warning: Failed to record cluster facts: {e}")
 
-            # Harvest server-side ground truth from Prometheus (bin-packing, PSI, snapshots)
-            try:
-                from server_telemetry import extract_and_record_server_telemetry
-
-                extract_and_record_server_telemetry(
-                    prom_url=args.prometheus_url,
-                    start_ts=run_ts,
-                    end_ts=run_end_ts,
-                    stats_history_csv=stats_history_csv,
-                    active_users=args.users,
-                    worker_pod_count=facts.get("worker_pod_count"),
-                    output_json_path=server_summary_json,
-                    jsonl_path=jsonl_path,
-                    data_ts=data_ts,
-                    tag=args.tag,
-                    test_name=args.name,
-                    logs=logs,
-                )
-            except Exception as e:
-                tee(logs, f"Warning: Failed to harvest server telemetry: {e}")
+        # Server telemetry is a Prometheus time-window query, so it runs
+        # either way. A run too loaded to write a CSV is the one its
+        # bin-packing, PSI and snapshot numbers matter most for.
+        try:
+            extract_and_record_server_telemetry(
+                prom_url=args.prometheus_url,
+                start_ts=run_ts,
+                end_ts=run_end_ts,
+                stats_history_csv=stats_history_csv,
+                worker_pod_count=facts.get("worker_pod_count"),
+                output_json_path=server_summary_json,
+                jsonl_path=jsonl_path,
+                data_ts=data_ts,
+                tag=args.tag,
+                test_name=args.name,
+                logs=logs,
+            )
+        except Exception as e:
+            tee(logs, f"Warning: Failed to harvest server telemetry: {e}")
 
     status_path.write_text(
         json.dumps(

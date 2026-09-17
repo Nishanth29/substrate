@@ -41,32 +41,57 @@ roleRef:
   name: atelet-endpointslices
   apiGroup: rbac.authorization.k8s.io
 ---
-# Hardware discovery for the runner: runner.py reads nodes and worker pods to
-# derive cluster capacity frontiers. Same ClusterRole as the one in
-# benchmarking/locust/manifests/locust.yaml, repeated here so this manifest
-# stands alone -- the locust Deployment is not part of an automated run.
+# Hardware discovery for the runner: runner.py reads node capacity and worker
+# pod placement to derive cluster capacity frontiers. Named apart from the
+# equivalent in benchmarking/locust/manifests/locust.yaml so the two manifests
+# stand alone -- a ClusterRole is cluster-scoped, so two files declaring one
+# name are one object described twice, and the last apply silently wins.
+#
+# A node is a cluster-scoped resource, so it needs a ClusterRole. Worker pods
+# are only ever listed in one namespace, so they get a namespaced Role, the
+# same split monitoring.yaml makes for Prometheus.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: locust-hardware-discovery
+  name: benchmark-runner-hardware-discovery
 rules:
 - apiGroups: [""]
-  resources: ["nodes", "pods"]
+  resources: ["nodes"]
   # list only: the runner reads whole collections, never a single object.
   verbs: ["list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  # Intentionally not named locust-hardware-discovery: that binding belongs to
-  # locust.yaml. Two bindings on one ClusterRole add up, but two bindings
-  # sharing a name overwrite each other, silently revoking whichever subject
-  # the losing copy listed.
   name: benchmark-runner-hardware-discovery
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: locust-hardware-discovery
+  name: benchmark-runner-hardware-discovery
+subjects:
+- kind: ServiceAccount
+  name: benchmark-runner
+  namespace: benchmarking
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: benchmark-runner-worker-pods
+  namespace: benchmark-workloads
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: benchmark-runner-worker-pods
+  namespace: benchmark-workloads
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: benchmark-runner-worker-pods
 subjects:
 - kind: ServiceAccount
   name: benchmark-runner

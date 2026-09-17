@@ -18,16 +18,14 @@ Queries Prometheus over [T_start, T_end] and the steady-state window [T_steady, 
 to capture dynamic cluster packing, node PSI stalls, and snapshot throughput.
 """
 
-from __future__ import annotations
-
 import csv
 import json
 import math
-from pathlib import Path
 import sys
-from typing import Any, TextIO
 import urllib.parse
 import urllib.request
+from pathlib import Path
+from typing import Any, TextIO
 
 
 def query_prometheus_instant(
@@ -112,17 +110,23 @@ def compute_percentiles(values: list[float]) -> dict[str, float | None]:
 
 def get_steady_state_window(
     stats_history_csv: Path,
-    active_users: int,
     start_ts: int,
     end_ts: int,
 ) -> tuple[int, int]:
-    """Derives steady-state [T_steady, T_end] where User Count >= 0.9 * active_users."""
-    if not stats_history_csv.exists() or active_users <= 0:
+    """Derives the steady-state window [T_steady, T_end] from Locust's samples.
+
+    T_steady is the first sample reaching 90% of the highest user count the run
+    reached. The target is read from the samples rather than the `-u` flag,
+    because a custom load shape ignores the flag. Unlike the frontier
+    percentiles this has to stay a single threshold: the result is one
+    contiguous span, which is what a Prometheus range query takes.
+    """
+    if not stats_history_csv.exists():
         return start_ts, end_ts
 
-    steady_ts: int | None = None
+    samples: list[tuple[int, float]] = []
     try:
-        with open(stats_history_csv, "r", encoding="utf-8") as f:
+        with open(stats_history_csv, encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 name = row.get("Name", "")
@@ -132,15 +136,24 @@ def get_steady_state_window(
                     and "Timestamp" in row
                 ):
                     try:
-                        users = float(row["User Count"])
-                        ts = int(row["Timestamp"])
-                        if users >= active_users * 0.9:
-                            steady_ts = ts
-                            break
+                        samples.append((int(row["Timestamp"]),
+                                        float(row["User Count"])))
                     except (ValueError, TypeError):
                         continue
     except Exception:
-        pass
+        # A read that threw partway leaves only the rows before the fault,
+        # which drags the peak down and opens the window during ramp-up.
+        samples = []
+
+    peak = max((users for _, users in samples), default=0.0)
+    if peak <= 0:
+        return start_ts, end_ts
+
+    steady_ts: int | None = None
+    for ts, users in samples:
+        if users >= peak * 0.9:
+            steady_ts = ts
+            break
 
     if steady_ts is not None and start_ts <= steady_ts <= end_ts:
         return steady_ts, end_ts
@@ -152,9 +165,8 @@ def _parse_instant_float(res: list[dict[str, Any]]) -> float | None:
         try:
             v = float(res[0]["value"][1])
             return None if math.isnan(v) or math.isinf(v) else round(v, 4)
-        except (KeyError, IndexError, TypeError, ValueError):
-            # Every caller treats None as "no reading". A bad response shape
-            # must cost this one field, not the whole server_summary.json.
+        except (IndexError, TypeError, ValueError):
+            # Malformed response yields None for this field without failing harvest.
             pass
     return None
 
@@ -168,53 +180,116 @@ def _parse_instant_int(res: list[dict[str, Any]]) -> int | None:
     out". Mirrors _parse_instant_float.
     """
     val = _parse_instant_float(res)
-    return int(val) if val is not None else None
+    return round(val) if val is not None else None
 
 
-def _query_quantile_with_fallback(
+def _query_rate_quantile(
     prom_url: str,
     quantile: float,
     rate_metric_expr: str,
-    raw_metric_expr: str,
     end_ts: int,
     unit_scale: float = 1.0,
 ) -> float | None:
-    """Queries histogram quantile using rate(5m), falling back to cumulative buckets if NaN/empty."""
-    # _parse_instant_float maps NaN and Inf to None, so None is the only
-    # "no reading" value either query can produce.
-    q_rate = (
-        f"histogram_quantile({quantile}, sum({rate_metric_expr}) by (le)) / {unit_scale}"
-    )
-    val = _parse_instant_float(
-        query_prometheus_instant(prom_url, q_rate, time_ts=end_ts)
-    )
-    if val is not None:
-        return val
+    """Reads a histogram quantile over the trailing rate window.
 
-    # Fallback to cumulative bucket distribution
-    q_cum = (
-        f"histogram_quantile({quantile}, sum by (le) ({raw_metric_expr})) / {unit_scale}"
+    Scoped to the window the rate covers, so a quiet window reports nothing
+    rather than the distribution accumulated since the atelet started.
+    """
+    query = (
+        f"histogram_quantile({quantile}, sum({rate_metric_expr}) by (le))"
+        f" / {unit_scale}"
     )
     return _parse_instant_float(
-        query_prometheus_instant(prom_url, q_cum, time_ts=end_ts)
+        query_prometheus_instant(prom_url, query, time_ts=end_ts)
     )
 
 
-def harvest_server_telemetry(
+def _query_checkpoint_throughput(
+    prom_url: str, steady_start_ts: int, end_ts: int
+) -> float | None:
+    """Checkpoint write throughput in MiB/s across the steady-state window.
+
+    Bytes written over the seconds spent writing them, both read from the
+    histogram sums, so this is how fast a checkpoint writes rather than how
+    many bytes the cluster moved per second of wall clock. The duration is
+    pinned to the `total` phase because the sub-phases overlap and an
+    unpinned sum counts the same checkpoint more than once, and failed saves
+    are excluded because they spend time without writing anything.
+    """
+    window_s = end_ts - steady_start_ts
+    if window_s <= 0:
+        return None
+    written = _parse_instant_float(
+        query_prometheus_instant(
+            prom_url,
+            f"sum(increase(atelet_snapshot_size_bytes_sum[{window_s}s]))",
+            time_ts=end_ts,
+        )
+    )
+    spent = _parse_instant_float(
+        query_prometheus_instant(
+            prom_url,
+            "sum(increase(ate_actor_checkpoint_duration_seconds_sum"
+            '{ate_snapshot_phase="total", '
+            'ate_failure_reason!="FAILED_SAVE_SNAPSHOT"}'
+            f"[{window_s}s]))",
+            time_ts=end_ts,
+        )
+    )
+    # No seconds recorded against the checkpoints leaves the rate unknowable,
+    # where 0.0 would read as a stalled disk.
+    if written is None or spent is None or spent <= 0:
+        return None
+    return round((written / (1024 * 1024)) / spent, 2)
+
+
+def _psi_query(resource: str) -> str:
+    """The stall percentage query for one PSI resource, summed by instance.
+
+    `_waiting_` is PSI "some" (at least one task stalled); cAdvisor also
+    exports `_stalled_`, PSI "full" (all tasks stalled). "some" is the earlier
+    warning signal and the CPU full-stall series carries none, so one series
+    keeps the three comparable. Both are scraped, so "full" stays available.
+    """
+    return (
+        f'sum by (instance) (rate(container_pressure_{resource}_waiting_seconds_total'
+        '{container="node"}[1m])) * 100'
+    )
+
+
+def _steady_values(
+    results: list[dict[str, Any]], steady_start_ts: int
+) -> list[float]:
+    """Every range series value at or after `steady_start_ts`."""
+    vals = []
+    for s in results:
+        for pt in s.get("values", []):
+            try:
+                if int(pt[0]) >= steady_start_ts:
+                    # NaN and Inf are filtered downstream by compute_percentiles.
+                    vals.append(float(pt[1]))
+            except (ValueError, IndexError):
+                pass
+    return vals
+
+
+def _rpc_rate(method: str) -> str:
+    """The bucket rate expression for one AteomHerder RPC."""
+    return (
+        'rate(rpc_server_call_duration_seconds_bucket'
+        f'{{rpc_method="atelet.AteomHerder/{method}"}}[5m])'
+    )
+
+
+def _harvest_cluster_packing(
     prom_url: str,
     start_ts: int,
     end_ts: int,
     steady_start_ts: int,
     worker_pod_count: int | None,
 ) -> dict[str, Any]:
-    """Harvests all 4 ground truth metric streams from Prometheus."""
-    summary: dict[str, Any] = {
-        "cluster_packing": {},
-        "node_psi": {},
-        "snapshots": {},
-    }
-
-    # 1. Cluster Packing Timeseries (deduping ateapi replicas via max by state)
+    """Assigned workers over total workers, per sample and as percentiles."""
+    # Dedupes ateapi replicas via max by state.
     packing_query = (
         'max by (ate_worker_state) '
         '(ate_workerpool_workers{ate_workerpool_name="benchmark-ateom"})'
@@ -246,90 +321,67 @@ def harvest_server_telemetry(
         # the worker states Prometheus reports rather than assuming a number.
         total = (
             float(worker_pod_count)
-            if worker_pod_count
-            else (sum(states.values()) or 1.0)
+            if worker_pod_count is not None
+            else sum(states.values())
         )
-        ratio = round(assigned / total, 4)
+        # The total is recorded either way, but a ratio over zero workers is
+        # not a reading, so it stays null rather than taking a stand-in.
+        ratio = round(assigned / total, 4) if total > 0 else None
         packing_points.append({
             "timestamp": t,
             "assigned_workers": assigned,
             "total_workers": total,
             "packing_ratio": ratio,
         })
-        if t >= steady_start_ts:
+        if t >= steady_start_ts and ratio is not None:
             steady_packing_ratios.append(ratio)
 
-    summary["cluster_packing"] = {
+    return {
         "summary": compute_percentiles(steady_packing_ratios),
         "timeseries": packing_points,
     }
 
-    # 2. Host Linux Kernel PSI Stalls & CFS Throttling
-    #
-    # _waiting_ is PSI "some" (at least one task stalled); cAdvisor also
-    # exports _stalled_, PSI "full" (all tasks stalled). "some" is the earlier
-    # warning signal and the CPU full-stall series carries none, so one series
-    # keeps the three comparable. Both are scraped, so "full" stays available.
-    def psi_query(resource: str) -> str:
-        return (
-            f'sum by (instance) (rate(container_pressure_{resource}_waiting_seconds_total'
-            '{container="node"}[1m])) * 100'
-        )
 
-    # container!="" drops the per-pod rollups cAdvisor reports alongside each
-    # container, which would double count. Unlike the memory and CPU series
-    # these are not dropped at scrape time (see monitoring.yaml).
-    cfs_throttled_query = (
-        'sum(rate(container_cpu_cfs_throttled_seconds_total'
-        '{container!=""}[1m]))'
-    )
-
+def _harvest_node_psi(
+    prom_url: str, start_ts: int, end_ts: int, steady_start_ts: int
+) -> dict[str, Any]:
+    """Host kernel pressure stall percentages over the steady-state window."""
     psi_cpu_res = query_prometheus_range(
-        prom_url, psi_query("cpu"), start_ts, end_ts, step="5s"
+        prom_url, _psi_query("cpu"), start_ts, end_ts, step="5s"
     )
     psi_mem_res = query_prometheus_range(
-        prom_url, psi_query("memory"), start_ts, end_ts, step="5s"
+        prom_url, _psi_query("memory"), start_ts, end_ts, step="5s"
     )
     psi_io_res = query_prometheus_range(
-        prom_url, psi_query("io"), start_ts, end_ts, step="5s"
-    )
-    cfs_res = query_prometheus_range(
-        prom_url, cfs_throttled_query, start_ts, end_ts, step="5s"
+        prom_url, _psi_query("io"), start_ts, end_ts, step="5s"
     )
 
-    def extract_steady_values(results: list[dict[str, Any]]) -> list[float]:
-        vals = []
-        for s in results:
-            for pt in s.get("values", []):
-                try:
-                    if int(pt[0]) >= steady_start_ts:
-                        v = float(pt[1])
-                        # Inf needs no filter here: compute_percentiles is the
-                        # only consumer and it drops both NaN and Inf.
-                        if not math.isnan(v):
-                            vals.append(v)
-                except (ValueError, IndexError):
-                    pass
-        return vals
-
-    summary["node_psi"] = {
-        "cpu_stall_pct": compute_percentiles(extract_steady_values(psi_cpu_res)),
-        "mem_stall_pct": compute_percentiles(extract_steady_values(psi_mem_res)),
-        "io_stall_pct": compute_percentiles(extract_steady_values(psi_io_res)),
-        "cfs_throttled_rate": compute_percentiles(extract_steady_values(cfs_res)),
+    return {
+        "cpu_stall_pct": compute_percentiles(
+            _steady_values(psi_cpu_res, steady_start_ts)
+        ),
+        "mem_stall_pct": compute_percentiles(
+            _steady_values(psi_mem_res, steady_start_ts)
+        ),
+        "io_stall_pct": compute_percentiles(
+            _steady_values(psi_io_res, steady_start_ts)
+        ),
     }
 
-    # 3. Snapshot Sizes, Checkpoint Count & Latencies (with histogram fallback)
-    snap_bucket = "atelet_snapshot_size_bytes_bucket"
-    snap_rate = f"rate({snap_bucket}[5m])"
-    snap_p50 = _query_quantile_with_fallback(
-        prom_url, 0.50, snap_rate, snap_bucket, end_ts, unit_scale=1024 * 1024
+
+def _harvest_snapshots(
+    prom_url: str, steady_start_ts: int, end_ts: int
+) -> dict[str, Any]:
+    """Snapshot sizes, checkpoint volume, latencies and write throughput."""
+    snap_rate = "rate(atelet_snapshot_size_bytes_bucket[5m])"
+    snap_p50 = _query_rate_quantile(
+        prom_url, 0.50, snap_rate, end_ts, unit_scale=1024 * 1024
     )
-    snap_p90 = _query_quantile_with_fallback(
-        prom_url, 0.90, snap_rate, snap_bucket, end_ts, unit_scale=1024 * 1024
+    snap_p90 = _query_rate_quantile(
+        prom_url, 0.90, snap_rate, end_ts, unit_scale=1024 * 1024
     )
-    snap_p95 = _query_quantile_with_fallback(
-        prom_url, 0.95, snap_rate, snap_bucket, end_ts, unit_scale=1024 * 1024
+    snap_p95 = _query_rate_quantile(
+        prom_url, 0.95, snap_rate, end_ts, unit_scale=1024 * 1024
     )
 
     snap_count_query = "sum(atelet_snapshot_size_bytes_count)"
@@ -369,44 +421,17 @@ def harvest_server_telemetry(
     ):
         snap_avg = round((s_end - s_start) / window_checkpoints / (1024 * 1024), 4)
 
-    def rpc_bucket(method: str) -> str:
-        return (
-            'rpc_server_call_duration_seconds_bucket'
-            f'{{rpc_method="atelet.AteomHerder/{method}"}}'
-        )
+    restore_rate = _rpc_rate("Restore")
+    ckpt_rate = _rpc_rate("Checkpoint")
 
-    restore_bucket = rpc_bucket("Restore")
-    restore_rate = f"rate({restore_bucket}[5m])"
-    ckpt_bucket = rpc_bucket("Checkpoint")
-    ckpt_rate = f"rate({ckpt_bucket}[5m])"
+    restore_p50 = _query_rate_quantile(prom_url, 0.50, restore_rate, end_ts)
+    restore_p95 = _query_rate_quantile(prom_url, 0.95, restore_rate, end_ts)
+    ckpt_p50 = _query_rate_quantile(prom_url, 0.50, ckpt_rate, end_ts)
+    ckpt_p95 = _query_rate_quantile(prom_url, 0.95, ckpt_rate, end_ts)
 
-    restore_p50 = _query_quantile_with_fallback(
-        prom_url, 0.50, restore_rate, restore_bucket, end_ts
-    )
-    restore_p95 = _query_quantile_with_fallback(
-        prom_url, 0.95, restore_rate, restore_bucket, end_ts
-    )
-    ckpt_p50 = _query_quantile_with_fallback(
-        prom_url, 0.50, ckpt_rate, ckpt_bucket, end_ts
-    )
-    ckpt_p95 = _query_quantile_with_fallback(
-        prom_url, 0.95, ckpt_rate, ckpt_bucket, end_ts
-    )
+    checkpoint_mb_s = _query_checkpoint_throughput(prom_url, steady_start_ts, end_ts)
 
-    steady_duration_s = max(1, end_ts - steady_start_ts)
-    throughput_mb_s = None
-    # `is not None`, not truthiness: a genuine 0.0 median or 0 checkpoints is a
-    # reading, not a missing value, and must not be mistaken for an absent one.
-    if (
-        snap_p50 is not None
-        and window_checkpoints is not None
-        and window_checkpoints > 0
-    ):
-        throughput_mb_s = round(
-            (snap_p50 * window_checkpoints) / steady_duration_s, 2
-        )
-
-    summary["snapshots"] = {
+    return {
         "size_p50_mb": snap_p50,
         "size_p90_mb": snap_p90,
         "size_p95_mb": snap_p95,
@@ -417,10 +442,25 @@ def harvest_server_telemetry(
         "restore_p95_s": restore_p95,
         "checkpoint_p50_s": ckpt_p50,
         "checkpoint_p95_s": ckpt_p95,
-        "throughput_mb_s": throughput_mb_s,
+        "checkpoint_mb_s": checkpoint_mb_s,
     }
 
-    return summary
+
+def harvest_server_telemetry(
+    prom_url: str,
+    start_ts: int,
+    end_ts: int,
+    steady_start_ts: int,
+    worker_pod_count: int | None,
+) -> dict[str, Any]:
+    """Harvests all three ground truth metric streams from Prometheus."""
+    return {
+        "cluster_packing": _harvest_cluster_packing(
+            prom_url, start_ts, end_ts, steady_start_ts, worker_pod_count
+        ),
+        "node_psi": _harvest_node_psi(prom_url, start_ts, end_ts, steady_start_ts),
+        "snapshots": _harvest_snapshots(prom_url, steady_start_ts, end_ts),
+    }
 
 
 def extract_and_record_server_telemetry(
@@ -428,7 +468,6 @@ def extract_and_record_server_telemetry(
     start_ts: int,
     end_ts: int,
     stats_history_csv: Path,
-    active_users: int,
     worker_pod_count: int | None,
     output_json_path: Path,
     jsonl_path: Path,
@@ -445,7 +484,7 @@ def extract_and_record_server_telemetry(
 
     log(f"Harvesting Prometheus metrics from {prom_url} over [{start_ts}, {end_ts}]...")
     steady_start, steady_end = get_steady_state_window(
-        stats_history_csv, active_users, start_ts, end_ts
+        stats_history_csv, start_ts, end_ts
     )
     log(
         f"Detected steady-state window: [{steady_start}, {steady_end}] "
@@ -471,7 +510,9 @@ def extract_and_record_server_telemetry(
         **telemetry,
     }
 
-    output_json_path.write_text(json.dumps(full_artifact, indent=2) + "\n")
+    output_json_path.write_text(
+        json.dumps(full_artifact, indent=2) + "\n", encoding="utf-8"
+    )
     log(f"Wrote server summary artifact to {output_json_path}")
 
     # Append normalized single-row summary into stats.jsonl
@@ -484,18 +525,21 @@ def extract_and_record_server_telemetry(
         "tag": tag,
         "test_name": test_name,
         "metric": "server_summary",
-        "cluster_packing_p50": packing_s.get("p50"),
-        "cluster_packing_p90": packing_s.get("p90"),
-        "cluster_packing_p99": packing_s.get("p99"),
-        "psi_cpu_stall_p90": psi.get("cpu_stall_pct", {}).get("p90"),
-        "psi_mem_stall_p90": psi.get("mem_stall_pct", {}).get("p90"),
-        "psi_io_stall_p90": psi.get("io_stall_pct", {}).get("p90"),
-        "cfs_throttled_rate_avg": psi.get("cfs_throttled_rate", {}).get("avg"),
-        "snapshot_size_p50_mb": snaps.get("size_p50_mb"),
-        "checkpoints_in_window": snaps.get("checkpoints_in_window"),
-        "restore_p50_s": snaps.get("restore_p50_s"),
-        "checkpoint_p50_s": snaps.get("checkpoint_p50_s"),
-        "checkpoint_throughput_mb_s": snaps.get("throughput_mb_s"),
+        # Flat here, nested in server_summary.json: the jsonl is the graph
+        # feed and every row in it carries the same five keys.
+        "measurements": {
+            "cluster_packing_p50": packing_s.get("p50"),
+            "cluster_packing_p90": packing_s.get("p90"),
+            "cluster_packing_p99": packing_s.get("p99"),
+            "psi_cpu_stall_p90": psi.get("cpu_stall_pct", {}).get("p90"),
+            "psi_mem_stall_p90": psi.get("mem_stall_pct", {}).get("p90"),
+            "psi_io_stall_p90": psi.get("io_stall_pct", {}).get("p90"),
+            "snapshot_size_p50_mb": snaps.get("size_p50_mb"),
+            "checkpoints_in_window": snaps.get("checkpoints_in_window"),
+            "restore_p50_s": snaps.get("restore_p50_s"),
+            "checkpoint_p50_s": snaps.get("checkpoint_p50_s"),
+            "checkpoint_mb_s": snaps.get("checkpoint_mb_s"),
+        },
     }
 
     with open(jsonl_path, "a", encoding="utf-8") as f:

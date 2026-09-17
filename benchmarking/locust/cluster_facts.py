@@ -17,10 +17,8 @@
 
 Reads allocatable CPU/RAM, node count and worker pod count from the Kubernetes
 API, then derives the actor-density frontiers (actors per node / vCPU / GB RAM
-and the A/P bin-packing percentiles) for a completed trial.
+and the actors-per-pod percentiles) for a completed trial.
 """
-
-from __future__ import annotations
 
 import argparse
 import csv
@@ -29,7 +27,6 @@ from pathlib import Path
 from typing import Any, TextIO
 
 from kubernetes import client, config
-from kubernetes.client.rest import ApiException
 from kubernetes.utils import parse_quantity
 
 API_TIMEOUT_SECONDS = 5
@@ -73,20 +70,19 @@ def _load_kube_config(logs: TextIO | None = None) -> bool:
         return False
 
 
-def _count_worker_pods(v1: client.CoreV1Api, logs: TextIO | None = None) -> int | None:
-    """Counts live pods in the worker pool.
+def _list_worker_pods(
+    v1: client.CoreV1Api, logs: TextIO | None = None
+) -> list[Any] | None:
+    """Lists the live pods of the worker pool.
 
-    Prefers the dedicated worker namespace and falls back to a cluster-wide
-    lookup for clusters that place the pool elsewhere. Listing a namespace that
-    does not exist returns an empty list rather than an error, so an empty
-    result is what "the pool is somewhere else" looks like and it has to
-    trigger the fallback.
+    The pool lives in one namespace by convention and the `WorkerPool` CRD is
+    namespaced, so this is a single scoped read. The listing is filtered
+    server-side by label and served from the watch cache. Use
+    --no-cluster-facts to skip discovery entirely.
 
-    Both listings are filtered server-side by label and served from the watch
-    cache, but the cluster-wide one still scans every pod, so it is logged
-    whenever it happens. Use --no-cluster-facts to skip discovery entirely.
+    Returns None only when the read failed. An empty list is a reading: the
+    namespace holds no live worker pods.
     """
-    namespaced_failed = False
     try:
         pods = v1.list_namespaced_pod(
             namespace=WORKER_POOL_NAMESPACE,
@@ -94,34 +90,22 @@ def _count_worker_pods(v1: client.CoreV1Api, logs: TextIO | None = None) -> int 
             resource_version="0",
             _request_timeout=API_TIMEOUT_SECONDS,
         ).items
-    except ApiException as e:
-        _log(logs, f"Notice: could not list pods in {WORKER_POOL_NAMESPACE}: {e.reason}")
-        pods = []
-        namespaced_failed = True
-
-    if not pods:
-        reason = (
-            "the namespaced lookup failed"
-            if namespaced_failed
-            else f"no {WORKER_POOL_LABEL} pods in {WORKER_POOL_NAMESPACE}"
-        )
-        _log(logs, f"Notice: {reason}; scanning all namespaces for the worker pool")
-        try:
-            pods = v1.list_pod_for_all_namespaces(
-                label_selector=WORKER_POOL_LABEL,
-                resource_version="0",
-                _request_timeout=API_TIMEOUT_SECONDS,
-            ).items
-        except ApiException as e:
-            _log(logs, f"Notice: cluster-wide pod lookup failed: {e.reason}")
-            return None
-
-    live = [p for p in pods if p.status.phase in LIVE_POD_PHASES]
-    return len(live) or None
+        return [p for p in pods if p.status.phase in LIVE_POD_PHASES]
+    except Exception as e:
+        # An ApiException prints its whole HTTP response, so log the reason on
+        # its own. Anything without one logs itself.
+        reason = getattr(e, "reason", e)
+        _log(logs,
+             f"Notice: could not list pods in {WORKER_POOL_NAMESPACE}: {reason}")
+        return None
 
 
 def get_cluster_hardware_facts(logs: TextIO | None = None) -> dict[str, Any]:
-    """Reads allocatable node capacity and worker pod count from the cluster.
+    """Reads the worker pool size and the capacity of the nodes it runs on.
+
+    Capacity is scoped to the nodes carrying worker pods, so a cluster that
+    keeps its infrastructure on a separate pool does not count that pool's
+    cores and memory against the density frontiers.
 
     Never raises: a trial must still publish its results when the cluster is
     unreadable, so any failure leaves the affected facts as None.
@@ -132,40 +116,49 @@ def get_cluster_hardware_facts(logs: TextIO | None = None) -> dict[str, Any]:
 
     v1 = client.CoreV1Api()
 
-    # resource_version="0" is served from the apiserver's watch cache rather
-    # than etcd, which keeps this cheap on large clusters.
+    pods = _list_worker_pods(v1, logs)
+
+    if pods is None:
+        # Without a pod set there is no node set, so capacity stays unmeasured
+        # rather than falling back to every node in the cluster.
+        return facts
+
+    facts["worker_pod_count"] = len(pods)
+
     try:
+        # A Pending pod may not be scheduled yet, so it counts toward the pool
+        # size without contributing a node.
+        worker_nodes = {p.spec.node_name for p in pods if p.spec.node_name}
+        # resource_version="0" is served from the apiserver's watch cache
+        # rather than etcd, avoiding a quorum read on large clusters.
         nodes = v1.list_node(
             resource_version="0", _request_timeout=API_TIMEOUT_SECONDS
         ).items
+        node_count = 0
         total_cores = 0.0
         total_ram_bytes = 0
         machine_types = set()
         for node in nodes:
+            metadata = node.metadata
+            if metadata is None or metadata.name not in worker_nodes:
+                continue
+            node_count += 1
             allocatable = node.status.allocatable or {}
-            if "cpu" in allocatable:
-                total_cores += float(parse_quantity(allocatable["cpu"]))
-            if "memory" in allocatable:
-                total_ram_bytes += int(parse_quantity(allocatable["memory"]))
-            labels = (node.metadata.labels or {}) if node.metadata else {}
-            machine_type = labels.get(MACHINE_TYPE_LABEL)
+            total_cores += float(parse_quantity(allocatable["cpu"]))
+            total_ram_bytes += int(parse_quantity(allocatable["memory"]))
+            machine_type = (metadata.labels or {}).get(MACHINE_TYPE_LABEL)
             if machine_type:
                 machine_types.add(machine_type)
-        facts["node_count"] = len(nodes)
+        facts["node_count"] = node_count
         facts["allocatable_cores"] = round(total_cores, 2)
-        # GiB, as the apiserver and kubectl quote it. Named _gb for continuity
-        # with rows already collected; renaming would break consumers.
+        # GiB, as the apiserver and kubectl quote it.
         facts["allocatable_ram_gb"] = round(total_ram_bytes / (1024**3), 2)
         # Kept so results stay comparable across hardware changes. A mixed pool
         # is a sorted comma-joined list rather than one node picked at random.
         facts["machine_type"] = ",".join(sorted(machine_types)) or None
     except Exception as e:
-        _log(logs, f"Notice: could not read node capacity: {e}")
-
-    try:
-        facts["worker_pod_count"] = _count_worker_pods(v1, logs)
-    except Exception as e:
-        _log(logs, f"Notice: could not count worker pods: {e}")
+        reason = getattr(e, "reason", e)
+        _log(logs, f"Notice: could not read node capacity: {reason}")
 
     return facts
 
@@ -179,25 +172,12 @@ def append_trial_summary(
     facts: dict[str, Any],
     logs: TextIO | None = None,
 ) -> None:
-    active_users = args.users
-    # Only the facts the frontier math divides by. machine_type is recorded
-    # but never computed with, so it goes straight into raw_configuration.
-    node_count = facts.get("node_count")
-    cores = facts.get("allocatable_cores")
-    ram_gb = facts.get("allocatable_ram_gb")
-    pod_count = facts.get("worker_pod_count")
-
-    actors_per_node = round(active_users / node_count, 2) if node_count else None
-    actors_per_vcpu = round(active_users / cores, 2) if cores else None
-    actors_per_gb_ram = round(active_users / ram_gb, 2) if ram_gb else None
-
-    # A/P bin-packing percentiles over the steady-state samples. None when
-    # unmeasurable: a ratio derived from configured user count is not a reading.
-    ap_p50, ap_p90, ap_p99 = None, None, None
-    if stats_history_csv.exists() and pod_count and pod_count > 0:
+    # Locust's own User Count samples. The -u flag is a request; under a custom
+    # load shape what actually ran is whatever the shape asked for.
+    observed: list[float] = []
+    if stats_history_csv.exists():
         try:
-            observed: list[float] = []
-            with open(stats_history_csv) as f:
+            with open(stats_history_csv, encoding="utf-8") as f:
                 for row in csv.DictReader(f):
                     if row.get("Name", "") not in ("", "Aggregated", "Total"):
                         continue
@@ -207,66 +187,90 @@ def append_trial_summary(
                         continue
                     if u > 0:
                         observed.append(u)
-            # Steady state is every sample at or above 90% of the target. A run
-            # that never got there falls back to every non-zero sample.
-            steady = [u for u in observed if u >= active_users * 0.9] or observed
-            if steady:
-                ratios = sorted(round(u / pod_count, 4) for u in steady)
-                n = len(ratios)
-                ap_p50 = round(ratios[int(n * 0.50)], 2)
-                ap_p90 = round(ratios[min(int(n * 0.90), n - 1)], 2)
-                ap_p99 = round(ratios[min(int(n * 0.99), n - 1)], 2)
         except Exception as e:
-            _log(logs, f"Notice: Error calculating A/P ratio percentiles: {e}")
+            _log(logs, f"Notice: could not read user counts: {e}")
+            # A read that threw partway leaves a truncated sample behind, and
+            # a truncated sample understates the peak without looking wrong.
+            observed = []
 
-    total_requests = 0
-    total_failures = 0
-    stats_parsed = False
+    # The flag stands in only when no sample was read at all.
+    peak_users = max(observed) if observed else args.users
+
+    node_count = facts.get("node_count")
+    cores = facts.get("allocatable_cores")
+    ram_gb = facts.get("allocatable_ram_gb")
+    pod_count = facts.get("worker_pod_count")
+
+    actors_per_node = round(peak_users / node_count, 2) if node_count else None
+    actors_per_vcpu = round(peak_users / cores, 2) if cores else None
+    actors_per_gb_ram = round(peak_users / ram_gb, 2) if ram_gb else None
+
+    # Actors per pod across every sample, ramp-up included. Under a load shape
+    # there is no one target to measure steadiness against, so the
+    # distribution covers the whole run.
+    actors_per_pod_p50, actors_per_pod_p90, actors_per_pod_p99 = None, None, None
+    if observed and pod_count:
+        ratios = sorted(round(u / pod_count, 4) for u in observed)
+        n = len(ratios)
+        actors_per_pod_p50 = round(ratios[int(n * 0.50)], 2)
+        actors_per_pod_p90 = round(ratios[min(int(n * 0.90), n - 1)], 2)
+        actors_per_pod_p99 = round(ratios[min(int(n * 0.99), n - 1)], 2)
+
+    # Locust's Aggregated row provides the total directly. Resume (including
+    # cold starts) and Suspend have separate SLOs, and their CSV Name values
+    # lack the grpc_ prefix added in stats.jsonl.
+    wanted = ("Aggregated", "ResumeActor", "ResumeActorColdStart",
+              "SuspendActor")
+    counts: dict[str, tuple[int, int]] = {}
     if stats_csv.exists():
         try:
-            with open(stats_csv) as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    name = row.get("Name", "")
-                    reqs = int(row.get("Request Count", 0) or 0)
-                    fails = int(row.get("Failure Count", 0) or 0)
-                    if name == "Aggregated":
-                        total_requests = reqs
-                        total_failures = fails
-                        break
-                    total_requests += reqs
-                    total_failures += fails
-            stats_parsed = True
+            with open(stats_csv, encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if row.get("Name", "") not in wanted:
+                        continue
+                    reqs = row.get("Request Count")
+                    fails = row.get("Failure Count")
+                    # Require both columns so missing values are not read as zero.
+                    if reqs is not None and fails is not None:
+                        counts[row["Name"]] = (int(reqs), int(fails))
         except Exception as e:
             _log(logs, f"Notice: could not parse {stats_csv}: {e}")
+            counts = {}
     else:
-        _log(logs, f"Notice: {stats_csv} not found; failure ratio unknown")
+        _log(logs, f"Notice: {stats_csv} not found; failure ratios unknown")
 
-    # None, not 0.0, when undetermined. A run with zero failures is a real
-    # result and must not look like one where the stats file was unreadable.
-    if stats_parsed and total_requests > 0:
-        failure_ratio = round(total_failures / total_requests, 4)
-    else:
-        failure_ratio = None
+    def failure_ratio(*names: str) -> float | None:
+        """Failures over requests across `names`, summed.
+
+        None, not 0.0, when undetermined. A run with zero failures is a real
+        result and must not look like one where the rows were unreadable or
+        the RPC never ran.
+        """
+        rows = [counts[n] for n in names if n in counts]
+        requests = sum(r for r, _ in rows)
+        if requests == 0:
+            return None
+        return round(sum(f for _, f in rows) / requests, 4)
 
     summary_entry = {
         "timestamp": data_ts,
         "tag": args.tag,
         "test_name": args.name,
         "metric": "trial_summary",
-        # Keyed off EMPTY_FACTS so the raw block always carries every fact,
-        # present or not, and the names are declared in one place.
-        "raw_configuration": {k: facts.get(k) for k in EMPTY_FACTS},
-        "frontiers": {
+        "measurements": {
+            **{k: facts.get(k) for k in EMPTY_FACTS},
             "actors_per_node": actors_per_node,
             "actors_per_vcpu": actors_per_vcpu,
             "actors_per_gb_ram": actors_per_gb_ram,
-            "ap_ratio_p50": ap_p50,
-            "ap_ratio_p90": ap_p90,
-            "ap_ratio_p99": ap_p99,
-            "aggregate_failure_ratio": failure_ratio,
+            "actors_per_pod_p50": actors_per_pod_p50,
+            "actors_per_pod_p90": actors_per_pod_p90,
+            "actors_per_pod_p99": actors_per_pod_p99,
+            "aggregate_failure_ratio": failure_ratio("Aggregated"),
+            "resume_actor_failure_ratio": failure_ratio(
+                "ResumeActor", "ResumeActorColdStart"),
+            "suspend_actor_failure_ratio": failure_ratio("SuspendActor"),
         },
     }
-    with open(jsonl_path, "a") as f:
+    with open(jsonl_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(summary_entry) + "\n")
     _log(logs, f"Appended trial_summary to {jsonl_path}")

@@ -84,8 +84,7 @@ Two flags control the optional post-run measurements described in
 
 * `--cluster-facts` / `--no-cluster-facts`: read node capacity and worker pod
   count from the Kubernetes API once the run ends, to derive density frontiers.
-  On by default. Pass `--no-cluster-facts` on a large cluster, where listing
-  every node and pod is expensive.
+  On by default. Pass `--no-cluster-facts` to skip Kubernetes API discovery.
 * `--prometheus-url`: the Prometheus to harvest server-side telemetry from.
   Defaults to the in-cluster service installed by
   [Optional: Prometheus + Grafana](#optional-prometheus--grafana).
@@ -137,26 +136,35 @@ them are checked into the repository.
   own CSV output.
 * `logs.txt`, `traces.txt`: the runner log, and the trace IDs seen during the run.
 * `stats.jsonl`: one JSON object per line, one per metric. Every row carries
-  `timestamp`, `tag`, `test_name` and `metric`.
+  the same five keys: `timestamp`, `tag`, `test_name`, `metric`, and a flat
+  `measurements` map holding that metric's numbers.
 * `server_summary.json`: server-side telemetry harvested from Prometheus,
   including the per-sample bin-packing timeseries.
 
 ### Density frontiers
 
 With cluster discovery enabled, `stats.jsonl` gains a `trial_summary` row
-describing how densely actors packed onto the hardware.
+describing how densely actors packed onto the hardware. Its `measurements`
+map holds the raw facts and the derived numbers side by side.
 
-* `raw_configuration`: the measured facts, before any arithmetic:
-  `machine_type`, `node_count`, `allocatable_cores`, `allocatable_ram_gb`
-  (GiB), `worker_pod_count`. They are recorded so the ratios below can be
-  re-derived later, or recomputed against a different denominator.
-* `frontiers.actors_per_node`, `frontiers.actors_per_vcpu`,
-  `frontiers.actors_per_gb_ram`: active users over the matching capacity.
-* `frontiers.ap_ratio_p50`, `ap_ratio_p90`, `ap_ratio_p99`: the
-  actor-to-pod ratio across the steady-state part of the run. Reported as a
-  distribution rather than one average, because the ratio moves a lot while
-  users are still ramping up.
-* `frontiers.aggregate_failure_ratio`: failures over requests for the run.
+* `machine_type`, `node_count`, `allocatable_cores`, `allocatable_ram_gb`
+  (GiB), `worker_pod_count`: the measured facts, before any arithmetic.
+  Capacity covers the nodes the worker pods are running on rather than the
+  whole cluster, so a separate infrastructure pool is not counted. They are
+  recorded so the ratios below can be re-derived later, or recomputed against
+  a different denominator.
+* `actors_per_node`, `actors_per_vcpu`, `actors_per_gb_ram`: the most users
+  Locust reported running, over the matching capacity. The `-u` flag only
+  stands in when no sample was read.
+* `actors_per_pod_p50`, `actors_per_pod_p90`, `actors_per_pod_p99`: users per
+  worker pod across the run. Reported as a distribution rather than one
+  average, and it spans ramp-up too, because a custom load shape has no
+  single user count to call steady.
+* `aggregate_failure_ratio`: failures over requests for the run.
+* `resume_actor_failure_ratio`, `suspend_actor_failure_ratio`: the same ratio
+  for the two RPCs the spec sets separate bars for. Resume sums the
+  `ResumeActor` and `ResumeActorColdStart` rows, since a cold start is still
+  a resume. Null when the RPC did not run.
 
 ### Server ground truth
 
@@ -167,17 +175,26 @@ actually did, independent of what the load generator reported.
   `summary` plus the per-sample `timeseries` it was computed from.
 * `node_psi.cpu_stall_pct`, `mem_stall_pct`, `io_stall_pct`: kernel pressure
   stall percentages on the nodes under test.
-* `node_psi.cfs_throttled_rate`: CFS quota throttling rate.
 * `snapshots.size_p50_mb`, `size_p90_mb`, `size_p95_mb`: actor snapshot sizes.
 * `snapshots.size_avg_mb`: mean snapshot size, taken from the histogram's
   own sum and count, so it is exact rather than bucket-interpolated.
 * `snapshots.checkpoint_p50_s`, `checkpoint_p95_s`, `restore_p50_s`,
   `restore_p95_s`: checkpoint and restore latency.
-* `snapshots.checkpoints_in_window`, `checkpoints_cumulative`,
-  `throughput_mb_s`: checkpoint volume over the steady-state window.
+* `snapshots.checkpoints_in_window`, `checkpoints_cumulative`: checkpoint
+  volume over the steady-state window.
+* `snapshots.checkpoint_mb_s`: bytes written over the seconds spent writing
+  them, taken from the histogram sums, so it reads as how fast a checkpoint
+  writes rather than how many bytes the cluster moved per second of wall
+  clock.
 
-A flattened subset of the same numbers is appended to `stats.jsonl` as a
-`server_summary` row, so both metrics can be read from the one file.
+A flattened subset of the same numbers goes into the `measurements` map of a
+`server_summary` row in `stats.jsonl`, so both metrics can be read from the
+one file.
+
+The `metadata.start_ts` the file records is when the runner started, not when
+load did, so the window it covers includes setup. That is deliberate, it gives
+the percentiles an idle stretch to sit against, but it does mean the window is
+a little longer than the test. The steady-state window is reported separately.
 
 Neither the Kubernetes API nor Prometheus is required. If either is unreachable,
 or discovery was skipped, the affected fields are written as `null` and the run
@@ -216,5 +233,3 @@ repository root:
 ```bash
 python3 -m unittest discover -s benchmarking/locust/unit_tests
 ```
-
-Tests that need the Kubernetes client are skipped when it is not installed.
