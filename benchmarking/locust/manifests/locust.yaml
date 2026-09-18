@@ -203,13 +203,6 @@ roleRef:
   name: atelet-endpointslices
   apiGroup: rbac.authorization.k8s.io
 ---
-# Hardware discovery for the locust runner: node capacity and worker pod
-# placement are read to compute cluster capacity frontiers (actors per vCPU,
-# per GB of RAM, and per pod).
-#
-# A node is a cluster-scoped resource, so it needs a ClusterRole. Worker pods
-# are only ever listed in one namespace, so they get a namespaced Role, the
-# same split monitoring.yaml makes for Prometheus.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

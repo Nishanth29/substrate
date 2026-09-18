@@ -156,10 +156,11 @@ map holds the raw facts and the derived numbers side by side.
   average, and it spans ramp-up too, because a custom load shape has no
   single user count to call steady.
 * `aggregate_failure_ratio`: failures over requests for the run.
-* `resume_actor_failure_ratio`, `suspend_actor_failure_ratio`: the same ratio
-  for the two RPCs the spec sets separate bars for. Resume sums the
-  `ResumeActor` and `ResumeActorColdStart` rows, since a cold start is still
-  a resume. Null when the RPC did not run.
+* `<operation>_failure_ratio`: the same ratio for every operation Locust
+  reported, so each test carries its own names through. The operation name is
+  lowercased with underscores, so `DurDirWrite` becomes
+  `dur_dir_write_failure_ratio`. A key is absent when the test has no such
+  row, and null when the row ran no requests.
 
 
 The Kubernetes API is not required. If it is unreachable, or discovery was

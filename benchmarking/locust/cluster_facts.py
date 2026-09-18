@@ -23,6 +23,7 @@ and the actors-per-pod percentiles) for a completed trial.
 import argparse
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -37,7 +38,7 @@ MACHINE_TYPE_LABEL = "node.kubernetes.io/instance-type"
 
 # Shape returned when the cluster cannot be read, or when discovery is skipped
 # with --no-cluster-facts. Keeping one definition means a trial_summary row has
-# the same keys either way, so consumers never have to special-case it.
+# the same hardware keys either way, so consumers never have to special-case it.
 EMPTY_FACTS: dict[str, Any] = {
     "machine_type": None,
     "node_count": None,
@@ -216,41 +217,33 @@ def append_trial_summary(
         actors_per_pod_p90 = round(ratios[min(int(n * 0.90), n - 1)], 2)
         actors_per_pod_p99 = round(ratios[min(int(n * 0.99), n - 1)], 2)
 
-    # Locust's Aggregated row provides the total directly. Resume (including
-    # cold starts) and Suspend have separate SLOs, and their CSV Name values
-    # lack the grpc_ prefix added in stats.jsonl.
-    wanted = ("Aggregated", "ResumeActor", "ResumeActorColdStart",
-              "SuspendActor")
-    counts: dict[str, tuple[int, int]] = {}
+    # One ratio per row Locust reported, so a test's own operation names carry
+    # through. Absent when the test has no such row, null when it ran nothing.
+    failure_ratios: dict[str, float | None] = {"aggregate_failure_ratio": None}
     if stats_csv.exists():
         try:
             with open(stats_csv, encoding="utf-8") as f:
                 for row in csv.DictReader(f):
-                    if row.get("Name", "") not in wanted:
-                        continue
+                    name = row.get("Name", "")
                     reqs = row.get("Request Count")
                     fails = row.get("Failure Count")
-                    # Require both columns so missing values are not read as zero.
-                    if reqs is not None and fails is not None:
-                        counts[row["Name"]] = (int(reqs), int(fails))
+                    # Both columns required so a missing one is not read as zero.
+                    if not name or reqs is None or fails is None:
+                        continue
+                    requests, failures = int(reqs), int(fails)
+                    ratio = round(failures / requests, 4) if requests else None
+                    if name == "Aggregated":
+                        failure_ratios["aggregate_failure_ratio"] = ratio
+                        continue
+                    key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+                    key = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", key)
+                    key = re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+                    failure_ratios[f"{key}_failure_ratio"] = ratio
         except Exception as e:
             _log(logs, f"Notice: could not parse {stats_csv}: {e}")
-            counts = {}
+            failure_ratios = {"aggregate_failure_ratio": None}
     else:
         _log(logs, f"Notice: {stats_csv} not found; failure ratios unknown")
-
-    def failure_ratio(*names: str) -> float | None:
-        """Failures over requests across `names`, summed.
-
-        None, not 0.0, when undetermined. A run with zero failures is a real
-        result and must not look like one where the rows were unreadable or
-        the RPC never ran.
-        """
-        rows = [counts[n] for n in names if n in counts]
-        requests = sum(r for r, _ in rows)
-        if requests == 0:
-            return None
-        return round(sum(f for _, f in rows) / requests, 4)
 
     summary_entry = {
         "timestamp": data_ts,
@@ -265,10 +258,7 @@ def append_trial_summary(
             "actors_per_pod_p50": actors_per_pod_p50,
             "actors_per_pod_p90": actors_per_pod_p90,
             "actors_per_pod_p99": actors_per_pod_p99,
-            "aggregate_failure_ratio": failure_ratio("Aggregated"),
-            "resume_actor_failure_ratio": failure_ratio(
-                "ResumeActor", "ResumeActorColdStart"),
-            "suspend_actor_failure_ratio": failure_ratio("SuspendActor"),
+            **failure_ratios,
         },
     }
     with open(jsonl_path, "a", encoding="utf-8") as f:

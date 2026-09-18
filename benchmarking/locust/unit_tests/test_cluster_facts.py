@@ -256,23 +256,24 @@ class ClusterFactsTest(unittest.TestCase):
         self.assertIsNone(ratio(None))                                  # file absent
 
     def test_per_rpc_failure_ratios(self):
-        # Resume ratio sums ResumeActor and ResumeActorColdStart.
+        # First resume is its own Locust row, so it gets its own key.
         stats = (STATS_HEADER
                  + "grpc,ResumeActor,100,2\n"
-                 + "grpc,ResumeActorColdStart,100,99\n"
+                 + "grpc,ResumeActorFirstResume,100,99\n"
                  + "grpc,SuspendActor,200,0\n"
                  + ",Aggregated,400,101\n")
         with tempfile.TemporaryDirectory() as td:
             f = summarize(FACTS, td, stats)["measurements"]
-        self.assertEqual(f["resume_actor_failure_ratio"], 0.505)   # 101 / 200
+        self.assertEqual(f["resume_actor_failure_ratio"], 0.02)               # 2 / 100
+        self.assertEqual(f["resume_actor_first_resume_failure_ratio"], 0.99)  # 99 / 100
         self.assertEqual(f["suspend_actor_failure_ratio"], 0.0)
         self.assertEqual(f["aggregate_failure_ratio"], 0.2525)     # 101 / 400
 
-        # Unexercised RPCs report None.
+        # An RPC the test never ran has no key at all.
         with tempfile.TemporaryDirectory() as td:
             row = summarize(FACTS, td, STATS_HEADER + ",Aggregated,10,0\n")
-        self.assertIsNone(row["measurements"]["resume_actor_failure_ratio"])
-        self.assertIsNone(row["measurements"]["suspend_actor_failure_ratio"])
+        self.assertNotIn("resume_actor_failure_ratio", row["measurements"])
+        self.assertNotIn("suspend_actor_failure_ratio", row["measurements"])
 
 
 if __name__ == "__main__":
