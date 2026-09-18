@@ -41,15 +41,6 @@ roleRef:
   name: atelet-endpointslices
   apiGroup: rbac.authorization.k8s.io
 ---
-# Hardware discovery for the runner: runner.py reads node capacity and worker
-# pod placement to derive cluster capacity frontiers. Named apart from the
-# equivalent in benchmarking/locust/manifests/locust.yaml so the two manifests
-# stand alone -- a ClusterRole is cluster-scoped, so two files declaring one
-# name are one object described twice, and the last apply silently wins.
-#
-# A node is a cluster-scoped resource, so it needs a ClusterRole. Worker pods
-# are only ever listed in one namespace, so they get a namespaced Role, the
-# same split monitoring.yaml makes for Prometheus.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
