@@ -204,10 +204,15 @@ class ClusterFactsTest(unittest.TestCase):
         self.assertEqual(set(row), {"timestamp", "tag", "test_name", "metric",
                                     "measurements"})
         m = row["measurements"]
-        self.assertEqual({k: m[k] for k in FACTS}, FACTS)
-        self.assertEqual(m["actors_per_node"], 10.0)    # 10 users / 1 node
-        self.assertEqual(m["actors_per_vcpu"], 2.55)    # 10 / 3.92
-        self.assertEqual(m["actors_per_gb_ram"], 0.77)  # 10 / 12.96
+        # Facts pass through untouched, just serialized.
+        self.assertEqual({k: m[k] for k in FACTS},
+                         {k: str(v) for k, v in FACTS.items()})
+        self.assertEqual(m["actors_per_node"], "10.0")    # 10 users / 1 node
+        self.assertEqual(m["actors_per_vcpu"], "2.55")    # 10 / 3.92
+        self.assertEqual(m["actors_per_gb_ram"], "0.77")  # 10 / 12.96
+        # Every value a string, so one row's types match every other row's.
+        self.assertTrue(all(isinstance(v, str)
+                            for v in m.values() if v is not None))
 
         # Unmeasured facts keep the same keys with None values.
         with tempfile.TemporaryDirectory() as td:
@@ -226,13 +231,13 @@ class ClusterFactsTest(unittest.TestCase):
         m = row["measurements"]
         self.assertEqual([m["actors_per_pod_p50"], m["actors_per_pod_p90"],
                           m["actors_per_pod_p99"]],
-                         [39.6, 55.8, 59.4])  # users 198, 279, 297 over 5 pods
+                         ["39.6", "55.8", "59.4"])  # users 198, 279, 297 over 5 pods
 
         # Uses observed peak (60) rather than requested -u (10).
         with tempfile.TemporaryDirectory() as td:
             row = summarize(FACTS, td, users=10, user_counts=[20, 40, 60])
-        self.assertEqual(row["measurements"]["actors_per_node"], 60.0)
-        self.assertEqual(row["measurements"]["actors_per_pod_p50"], 8.0)
+        self.assertEqual(row["measurements"]["actors_per_node"], "60.0")
+        self.assertEqual(row["measurements"]["actors_per_pod_p50"], "8.0")
 
         # Empty history falls back to -u for frontiers and None for percentiles.
         with tempfile.TemporaryDirectory() as td:
@@ -240,7 +245,7 @@ class ClusterFactsTest(unittest.TestCase):
         for key in ("actors_per_pod_p50", "actors_per_pod_p90",
                     "actors_per_pod_p99"):
             self.assertIsNone(row["measurements"][key])
-        self.assertEqual(row["measurements"]["actors_per_node"], 10.0)
+        self.assertEqual(row["measurements"]["actors_per_node"], "10.0")
 
     def test_failure_ratio(self):
         def ratio(stats):
@@ -248,8 +253,8 @@ class ClusterFactsTest(unittest.TestCase):
                 return summarize(FACTS, td, stats)["measurements"][
                     "aggregate_failure_ratio"]
 
-        self.assertEqual(ratio(STATS_HEADER + ",Aggregated,100,25\n"), 0.25)
-        self.assertEqual(ratio(STATS_HEADER + ",Aggregated,1708,0\n"), 0.0)
+        self.assertEqual(ratio(STATS_HEADER + ",Aggregated,100,25\n"), "0.25")
+        self.assertEqual(ratio(STATS_HEADER + ",Aggregated,1708,0\n"), "0.0")
         self.assertIsNone(ratio(STATS_HEADER + ",Aggregated,100\n"))    # truncated
         self.assertIsNone(ratio(STATS_HEADER + ",Aggregated,bad,5\n"))  # corrupt int
         self.assertIsNone(ratio(STATS_HEADER + ",Aggregated,0,0\n"))    # 0/0
@@ -264,10 +269,10 @@ class ClusterFactsTest(unittest.TestCase):
                  + ",Aggregated,400,101\n")
         with tempfile.TemporaryDirectory() as td:
             f = summarize(FACTS, td, stats)["measurements"]
-        self.assertEqual(f["resume_actor_failure_ratio"], 0.02)               # 2 / 100
-        self.assertEqual(f["resume_actor_first_resume_failure_ratio"], 0.99)  # 99 / 100
-        self.assertEqual(f["suspend_actor_failure_ratio"], 0.0)
-        self.assertEqual(f["aggregate_failure_ratio"], 0.2525)     # 101 / 400
+        self.assertEqual(f["resume_actor_failure_ratio"], "0.02")               # 2 / 100
+        self.assertEqual(f["resume_actor_first_resume_failure_ratio"], "0.99")  # 99 / 100
+        self.assertEqual(f["suspend_actor_failure_ratio"], "0.0")
+        self.assertEqual(f["aggregate_failure_ratio"], "0.2525")     # 101 / 400
 
         # An RPC the test never ran has no key at all.
         with tempfile.TemporaryDirectory() as td:

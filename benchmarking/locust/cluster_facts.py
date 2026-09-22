@@ -245,20 +245,25 @@ def append_trial_summary(
     else:
         _log(logs, f"Notice: {stats_csv} not found; failure ratios unknown")
 
+    measurements = {
+        **{k: facts.get(k) for k in EMPTY_FACTS},
+        "actors_per_node": actors_per_node,
+        "actors_per_vcpu": actors_per_vcpu,
+        "actors_per_gb_ram": actors_per_gb_ram,
+        "actors_per_pod_p50": actors_per_pod_p50,
+        "actors_per_pod_p90": actors_per_pod_p90,
+        "actors_per_pod_p99": actors_per_pod_p99,
+        **failure_ratios,
+    }
+
     summary_entry = {
         "timestamp": data_ts,
         "tag": args.tag,
         "test_name": args.name,
         "metric": "trial_summary",
         "measurements": {
-            **{k: facts.get(k) for k in EMPTY_FACTS},
-            "actors_per_node": actors_per_node,
-            "actors_per_vcpu": actors_per_vcpu,
-            "actors_per_gb_ram": actors_per_gb_ram,
-            "actors_per_pod_p50": actors_per_pod_p50,
-            "actors_per_pod_p90": actors_per_pod_p90,
-            "actors_per_pod_p99": actors_per_pod_p99,
-            **failure_ratios,
+            k: (str(v) if v is not None else None)
+            for k, v in measurements.items()
         },
     }
     with open(jsonl_path, "a", encoding="utf-8") as f:

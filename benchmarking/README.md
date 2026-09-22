@@ -139,7 +139,7 @@ them are checked into the repository.
 ### Density frontiers
 
 With cluster discovery enabled, `stats.jsonl` gains a `trial_summary` row
-describing how densely actors packed onto the hardware. Its `measurements`
+describing how densely actors are packed onto the hardware. Its `measurements`
 map holds the raw facts and the derived numbers side by side.
 
 * `machine_type`, `node_count`, `allocatable_cores`, `allocatable_ram_gb`
