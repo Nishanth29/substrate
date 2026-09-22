@@ -86,7 +86,7 @@ def discover(api):
 
 
 def summarize(facts, directory, stats=STATS_HEADER + ",Aggregated,100,25\n",
-              users=10, user_counts=None):
+              users=10, user_counts=None, actors_per_user=None):
     """Writes CSV inputs and returns the emitted trial_summary row."""
     d = Path(directory)
     if stats is not None:
@@ -101,7 +101,8 @@ def summarize(facts, directory, stats=STATS_HEADER + ",Aggregated,100,25\n",
     with contextlib.redirect_stdout(io.StringIO()):
         cluster_facts.append_trial_summary(
             out, d / "stats.csv", d / "stats_history.csv",
-            argparse.Namespace(users=users, tag="unit", name="unit-run"),
+            argparse.Namespace(users=users, tag="unit", name="unit-run",
+                               actors_per_user=actors_per_user),
             "2026-01-01", facts)
     return json.loads(out.read_text().splitlines()[0])
 
@@ -223,6 +224,24 @@ class ClusterFactsTest(unittest.TestCase):
                     "actors_per_pod_p50", "actors_per_pod_p90",
                     "actors_per_pod_p99"):
             self.assertIsNone(row["measurements"][key])
+
+    def test_actors_per_user_scales_every_key(self):
+        # One VU drives N actors, so the numerator is users * N everywhere.
+        with tempfile.TemporaryDirectory() as td:
+            row = summarize(FACTS, td, actors_per_user=3)
+        m = row["measurements"]
+        self.assertEqual(m["actors_per_node"], "30.0")    # 10 users * 3 / 1 node
+        self.assertEqual(m["actors_per_vcpu"], "7.65")    # 30 / 3.92 cores
+        self.assertEqual(m["actors_per_gb_ram"], "2.31")  # 30 / 12.96 GiB
+        # The percentiles scale too, not just the three frontiers.
+        self.assertEqual(m["actors_per_pod_p50"], "6.0")  # 30 / 5 pods
+
+        # Unset is boomer's default of one actor per VU, so nothing moves.
+        with tempfile.TemporaryDirectory() as td:
+            unset = summarize(FACTS, td)["measurements"]
+        with tempfile.TemporaryDirectory() as td:
+            one = summarize(FACTS, td, actors_per_user=1)["measurements"]
+        self.assertEqual(unset, one)
 
     def test_actors_per_pod_percentiles(self):
         with tempfile.TemporaryDirectory() as td:

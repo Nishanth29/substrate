@@ -197,21 +197,25 @@ def append_trial_summary(
     # The flag stands in only when no sample was read at all.
     peak_users = max(observed) if observed else args.users
 
+    # Locust counts VUs, not actors, and one VU drives --actors-per-user of them.
+    per_user = args.actors_per_user or 1
+    peak_actors = peak_users * per_user
+
     node_count = facts.get("node_count")
     cores = facts.get("allocatable_cores")
     ram_gb = facts.get("allocatable_ram_gb")
     pod_count = facts.get("worker_pod_count")
 
-    actors_per_node = round(peak_users / node_count, 2) if node_count else None
-    actors_per_vcpu = round(peak_users / cores, 2) if cores else None
-    actors_per_gb_ram = round(peak_users / ram_gb, 2) if ram_gb else None
+    actors_per_node = round(peak_actors / node_count, 2) if node_count else None
+    actors_per_vcpu = round(peak_actors / cores, 2) if cores else None
+    actors_per_gb_ram = round(peak_actors / ram_gb, 2) if ram_gb else None
 
     # Actors per pod across every sample, ramp-up included. Under a load shape
     # there is no one target to measure steadiness against, so the
     # distribution covers the whole run.
     actors_per_pod_p50, actors_per_pod_p90, actors_per_pod_p99 = None, None, None
     if observed and pod_count:
-        ratios = sorted(round(u / pod_count, 4) for u in observed)
+        ratios = sorted(round(u * per_user / pod_count, 4) for u in observed)
         n = len(ratios)
         actors_per_pod_p50 = round(ratios[int(n * 0.50)], 2)
         actors_per_pod_p90 = round(ratios[min(int(n * 0.90), n - 1)], 2)

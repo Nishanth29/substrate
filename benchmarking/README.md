@@ -148,10 +148,10 @@ map holds the raw facts and the derived numbers side by side.
   whole cluster, so a separate infrastructure pool is not counted. They are
   recorded so the ratios below can be re-derived later, or recomputed against
   a different denominator.
-* `actors_per_node`, `actors_per_vcpu`, `actors_per_gb_ram`: the most users
+* `actors_per_node`, `actors_per_vcpu`, `actors_per_gb_ram`: the most actors
   Locust reported running, over the matching capacity. The `-u` flag only
   stands in when no sample was read.
-* `actors_per_pod_p50`, `actors_per_pod_p90`, `actors_per_pod_p99`: users per
+* `actors_per_pod_p50`, `actors_per_pod_p90`, `actors_per_pod_p99`: actors per
   worker pod across the run. Reported as a distribution rather than one
   average, and it spans ramp-up too, because a custom load shape has no
   single user count to call steady.
@@ -162,6 +162,19 @@ map holds the raw facts and the derived numbers side by side.
   `dur_dir_write_failure_ratio`. A key is absent when the test has no such
   row, and null when the row ran no requests.
 
+The six `actors_per_*` ratios rest on three assumptions. Read them before
+comparing numbers across runs:
+
+* **Actors are derived, not counted.** Locust only sees virtual users, so the
+  numerator is the peak user count times `--actors-per-user`. No server-side
+  gauge counts resident actors: `ate.actor.stats.sampled_actors` drops any
+  actor without a live resource measurement, so suspended ones fall out.
+* **The denominators are read once, after the run.** A cluster that autoscaled
+  mid-run is measured at its final size, so the ratio pairs a peak from one
+  moment with a capacity from another.
+* **The peak assumes every actor is alive at once.** A workload that creates
+  and deletes actors as it goes never holds them all at the same time, so its
+  real density is lower than reported.
 
 The Kubernetes API is not required. If it is unreachable, or discovery was
 skipped, the affected fields are written as `null` and the run still
