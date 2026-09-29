@@ -1,0 +1,42 @@
+# SWE-perf agent workload (benchmarking/locust/tests/sweperf.py).
+# Runs on gke-substrate-kubetest2-sweperf-load-test.
+tests:
+  - name: sweperf_astropy_1_user
+    type: locust
+    description: "SWE-perf astropy-7336: 1 concurrent user for 10 minutes"
+    targetCluster: dev
+    file: /app/tests/sweperf.py
+    duration: 10m
+    users: 1
+    workerCount: 3
+    flags:
+      - "--sweperf-template"
+      - "swebench-astropy-7336"
+      - "--trace-probability"
+      - "1.0"
+  - name: sweperf_astropy_15_users
+    type: locust
+    description: "SWE-perf astropy-7336: 15 concurrent users for 10 minutes"
+    targetCluster: dev
+    file: /app/tests/sweperf.py
+    duration: 10m
+    users: 15
+    workerCount: 3
+    flags:
+      - "--sweperf-template"
+      - "swebench-astropy-7336"
+      - "--trace-probability"
+      - "0.5"
+  - name: sweperf_astropy_60_users
+    type: locust
+    description: "SWE-perf astropy-7336: 60 concurrent users for 10 minutes"
+    targetCluster: dev
+    file: /app/tests/sweperf.py
+    duration: 10m
+    users: 60
+    workerCount: 3
+    flags:
+      - "--sweperf-template"
+      - "swebench-astropy-7336"
+      - "--trace-probability"
+      - "0.1"
