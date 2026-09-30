@@ -421,8 +421,12 @@ def _harvest_snapshots(
             for q in (0.50, 0.90, 0.95, 0.99)
         ]
 
-    # pages.img is the memory image and dominates the bytes, so sizes scope to it.
-    snap_selector = 'atelet_snapshot_size_bytes%s{file_name="pages.img"}'
+    # Sizes and the checkpoint count scope to the memory image, which each
+    # checkpoint writes once: pages.img (gVisor) or memory-ranges (microVM).
+    # A run mixing both runtimes blends their sizes into one distribution.
+    snap_selector = (
+        'atelet_snapshot_size_bytes%s{file_name=~"pages.img|memory-ranges"}'
+    )
     size_q = quantiles(snap_selector % "_bucket", scale=mb)
 
     count, count_end = _window_delta(

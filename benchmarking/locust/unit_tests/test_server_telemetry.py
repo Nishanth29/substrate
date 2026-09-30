@@ -81,10 +81,13 @@ def parse(*extra):
 
 MB = 1024 * 1024
 
+# The memory image selector: pages.img (gVisor) or memory-ranges (microVM).
+MEMORY_IMAGE = '{file_name=~"pages.img|memory-ranges"}'
+
 # Each cumulative sum _harvest_snapshots reads, by a substring of its query.
 SUMS = {
-    "count": 'atelet_snapshot_size_bytes_count{file_name="pages.img"}',
-    "size": 'atelet_snapshot_size_bytes_sum{file_name="pages.img"}',
+    "count": "atelet_snapshot_size_bytes_count" + MEMORY_IMAGE,
+    "size": "atelet_snapshot_size_bytes_sum" + MEMORY_IMAGE,
     "bytes": "sum(atelet_snapshot_size_bytes_sum)",
     "seconds": "ate_actor_checkpoint_duration_seconds_sum",
     "restore_sum": 'seconds_sum{rpc_method="atelet.AteomHerder/Restore"}',
@@ -477,6 +480,25 @@ class ServerTelemetryTest(unittest.TestCase):
                  if "ate_actor_checkpoint_duration_seconds_sum" in c.args[1]]
         self.assertIn('ate_snapshot_phase="total"', spent[0])
         self.assertNotIn("ate_failure_reason", spent[0])
+
+    @mock.patch("server_telemetry.query_prometheus_instant")
+    def test_snapshot_selector_covers_both_runtimes(self, mock_instant):
+        # Sizes and the count read the memory image of either runtime; the
+        # byte total for checkpoint_mb_s still sums every file.
+        mock_instant.side_effect = snapshot_prom(
+            "1.0", start={"count": "100", "size": str(300 * MB)},
+            end={"count": "150", "size": str(400 * MB)})
+        snaps = snapshots()
+        self.assertEqual(snaps["checkpoints_in_window"], 50)
+        self.assertEqual(snaps["size_avg_mb"], 2.0)
+
+        queries = [c.args[1] for c in mock_instant.call_args_list]
+        sizes = [q for q in queries if "atelet_snapshot_size_bytes" in q]
+        self.assertTrue(any("_bucket" + MEMORY_IMAGE in q for q in sizes))
+        self.assertTrue(any("_count" + MEMORY_IMAGE in q for q in sizes))
+        self.assertTrue(any("_sum" + MEMORY_IMAGE in q for q in sizes))
+        self.assertFalse(any('file_name="pages.img"' in q for q in sizes))
+        self.assertIn("sum(atelet_snapshot_size_bytes_sum)", queries)
 
     def test_prometheus_url_flag(self):
         self.assertEqual(parse().prometheus_url, runner.DEFAULT_PROMETHEUS_URL)
