@@ -1,0 +1,47 @@
+# Temporary (fork only): SWE-perf astropy-7336 on c3-highmem-192-metal, gVisor and microVM.
+# Used by the manual prow pilot gke-substrate-kubetest2-sweperf-c3hm192metal-nishanth.
+tests:
+  - name: sweperf_astropy_150u_think_c3hm192metal_gvisor
+    type: locust
+    description: "SWE-perf astropy-7336: 150 users, 12-24s think time, 10 minutes, c3-highmem-192-metal (gVisor)"
+    targetCluster: dev
+    sandboxClass: gvisor
+    file: /app/tests/sweperf.py
+    duration: 10m
+    users: 150
+    workerCount: 3
+    ateArgs:
+      - "--cordon-control-plane"
+    flags:
+      - "--sweperf-template"
+      - "swebench-astropy-7336"
+      - "--min-wait-time"
+      - "12.0"
+      - "--max-wait-time"
+      - "24.0"
+      - "--spawn-rate"
+      - "15"
+      - "--trace-probability"
+      - "0.05"
+  - name: sweperf_astropy_150u_think_c3hm192metal_microvm
+    type: locust
+    description: "SWE-perf astropy-7336: 150 users, 12-24s think time, 10 minutes, c3-highmem-192-metal (microVM)"
+    targetCluster: dev
+    sandboxClass: microvm
+    file: /app/tests/sweperf.py
+    duration: 10m
+    users: 150
+    workerCount: 3
+    ateArgs:
+      - "--cordon-control-plane"
+    flags:
+      - "--sweperf-template"
+      - "swebench-astropy-7336"
+      - "--min-wait-time"
+      - "12.0"
+      - "--max-wait-time"
+      - "24.0"
+      - "--spawn-rate"
+      - "15"
+      - "--trace-probability"
+      - "0.05"
