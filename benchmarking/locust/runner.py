@@ -332,6 +332,10 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
         "-t", args.duration,
         "-u", str(args.users),
         "--csv", str(csv_prefix),
+        # Every operation's row in stats_history.csv, not just Aggregated, so
+        # each one's latency can be charted over the run. Readers of the file
+        # here keep to the Aggregated rows.
+        "--csv-full-history",
     ]
     if with_boomer:
         # Master mode so boomer can connect as a worker on localhost:5557.

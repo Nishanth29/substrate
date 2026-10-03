@@ -367,7 +367,9 @@ them are checked into the repository.
   those two keys, because it is what CI orchestration reads to decide whether a
   trial ran at all.
 * `stats.csv`, `stats_history.csv`, `failures.csv`, `exceptions.csv`: Locust's
-  own CSV output.
+  own CSV output. `stats_history.csv` has a row per operation every second as
+  well as the `Aggregated` row, so each operation's latency can be charted
+  over the run; filter to `Aggregated` for run-wide numbers.
 * `logs.txt`, `traces.txt`: the runner log, and the trace IDs seen during the run.
 * `stats.jsonl`: one JSON object per line, one per metric. Every row carries
   the same five keys: `timestamp`, `tag`, `test_name`, `metric`, and a flat
@@ -407,7 +409,9 @@ comparing numbers across runs:
 * **Actors are derived, not counted.** Locust only sees virtual users, so the
   numerator is the peak user count times `--actors-per-user`. No server-side
   gauge counts resident actors: `ate.actor.stats.sampled_actors` drops any
-  actor without a live resource measurement, so suspended ones fall out.
+  actor without a live resource measurement, so suspended ones fall out. It
+  is recorded as `active_actors` in `server_summary.json`, a running-actor
+  count rather than a resident one.
 * **The denominators are read once, after the run.** A cluster that autoscaled
   mid-run is measured at its final size, so the ratio pairs a peak from one
   moment with a capacity from another.
@@ -433,11 +437,24 @@ actually did, independent of what the load generator reported.
 * `snapshots.size_p50_mb` through `size_p99_mb`: actor memory image sizes.
 * `snapshots.size_avg_mb`: mean memory image size.
 * `snapshots.restore_p50_s` through `restore_p99_s`, `restore_mean_s`, and the
-  same for `checkpoint_*`: atelet restore and checkpoint latency.
+  same for `checkpoint_*`: how long the atelet took to resume or suspend an
+  actor from or to its own snapshot (`ate_actor_{restore,checkpoint}_duration`,
+  `total` phase, kind `latest`). A template's first start (`golden`) and a
+  pause (`local`) are left out. The buckets reach 60s, so a slower operation
+  reads as 60s.
 * `snapshots.checkpoints_in_window`, `checkpoints_cumulative`: checkpoint
   volume over the steady-state window, and since the atelet started.
 * `snapshots.checkpoint_mb_s`: bytes written per second spent checkpointing,
   not per second of wall clock.
+* `active_actors`: running actors (`ate_actor_stats_sampled_actors`), as a
+  percentile `summary` of the cluster-wide count, `per_atelet` percentiles
+  over the samples where a node hosted an actor, `atelets` seen, and the
+  cluster-wide `timeseries` every 10s over the run. As the assumptions above
+  note, the gauge drops actors without a live measurement, so suspended ones
+  fall out and the count dips while actors are suspended. A sample with no
+  series counts as 0, since the atelet stops exporting when a node has no
+  running actor; if the metric never appeared during the run, every field is
+  `null`.
 
 Every distribution reports p50, p90, p95 and p99 over the steady-state window.
 The steady-state window runs from the first to the last Locust sample at 90% or
@@ -451,8 +468,8 @@ every 10s.
 The atelet exports before Prometheus scrapes it, so the harvest waits
 `--atelet-lag-s` seconds (default 70, enough for the OTel SDK's 60s default
 export and a 10s scrape)
-and reads the snapshot window half that late. The window ends at the last
-full-load sample, so teardown suspends are left out.
+and reads the snapshot and `active_actors` windows half that late. The window
+ends at the last full-load sample, so teardown suspends are left out.
 
 `metadata.start_ts` and `end_ts` bound the whole run, which the packing
 `timeseries` covers. `steady_start_ts` and `steady_end_ts` bound the
