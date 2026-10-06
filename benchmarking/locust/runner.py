@@ -79,6 +79,17 @@ PY_TRACE_RE = re.compile(
 )
 
 
+def json_object(value: str) -> dict[str, Any]:
+    """argparse type for --metadata: a JSON object, checked before the run."""
+    try:
+        obj = json.loads(value)
+    except json.JSONDecodeError as e:
+        raise argparse.ArgumentTypeError(f"not valid JSON: {e}") from e
+    if not isinstance(obj, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    return obj
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("-f", required=True, dest="file", help="Locust test file (-f)")
@@ -144,6 +155,15 @@ def parse_args() -> argparse.Namespace:
             "Read node capacity and worker pod count from the Kubernetes API "
             "after the run to derive density frontiers. Pass "
             "--no-cluster-facts to skip Kubernetes API discovery"
+        ),
+    )
+    p.add_argument(
+        "--metadata",
+        type=json_object,
+        default={},
+        help=(
+            "Free-form JSON object describing the run, such as where it ran. "
+            "Each key is recorded in trial_summary as metadata_<key>"
         ),
     )
     p.add_argument(
@@ -332,6 +352,10 @@ def run_test(args: argparse.Namespace, csv_prefix: Path, logs: TextIO, traces: T
         "-t", args.duration,
         "-u", str(args.users),
         "--csv", str(csv_prefix),
+        # Every operation's row in stats_history.csv, not just Aggregated, so
+        # each one's latency can be charted over the run. Readers of the file
+        # here keep to the Aggregated rows.
+        "--csv-full-history",
     ]
     if with_boomer:
         # Master mode so boomer can connect as a worker on localhost:5557.
@@ -473,7 +497,7 @@ def upload(src: Path, dest: str) -> None:
 def collect_cluster_facts(
     args: argparse.Namespace, logs: TextIO
 ) -> dict[str, Any]:
-    """Returns cluster hardware facts, or empty facts when discovery is off."""
+    """Returns cluster facts, or empty facts when discovery is off."""
     if not args.cluster_facts:
         tee(logs, "Skipping cluster hardware discovery (--no-cluster-facts)")
         return dict(EMPTY_FACTS)
@@ -559,6 +583,8 @@ def main() -> None:
                     data_ts,
                     facts,
                     logs,
+                    run_start=run_ts,
+                    run_end=run_end_ts,
                 )
             except Exception as e:
                 tee(logs, f"Warning: Failed to record cluster facts: {e}")
