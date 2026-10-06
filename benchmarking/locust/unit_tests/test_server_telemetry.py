@@ -539,7 +539,7 @@ class ServerTelemetryTest(unittest.TestCase):
     @mock.patch("server_telemetry.query_prometheus_range")
     def test_active_actors(self, mock_range):
         def active(lag_s=0, steady=(100, 130)):
-            return server_telemetry._harvest_active_actors(
+            return server_telemetry._count_active_actors(
                 "http://localhost:9090", 100, 130, *steady, lag_s=lag_s)
 
         # Two atelets; at 120 neither has an actor, so no series at all.
@@ -563,6 +563,24 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertIn("sum by (instance, exported_instance)", query)
         self.assertIn("ate_actor_stats_sampled_actors", query)
 
+        # Per point, across the atelets hosting an actor at that moment.
+        p100, p110, p120, p130 = out["timeseries"]
+        self.assertEqual(p100["active_atelets"], 2)
+        # Nearest rank: [1, 2] gives p50 2, while avg is the true mean.
+        self.assertEqual((p100["per_atelet_min"], p100["per_atelet_p50"],
+                          p100["per_atelet_max"], p100["per_atelet_avg"]),
+                         (1.0, 2.0, 2.0, 1.5))
+        self.assertEqual((p110["active_atelets"], p110["per_atelet_p50"]),
+                         (2, 3.0))
+        # No atelet hosting: same keys, all null.
+        self.assertEqual(p120["active_atelets"], 0)
+        self.assertTrue(all(
+            p120[f"per_atelet_{k}"] is None for k in NO_PERCENTILES))
+        # b dropped out, so only a counts (the sweperf case).
+        self.assertEqual(p130["active_atelets"], 1)
+        self.assertTrue(all(
+            p130[f"per_atelet_{k}"] == 4.0 for k in NO_PERCENTILES))
+
         # The steady window bounds the summary but not the timeseries.
         out = active(steady=(100, 110))
         self.assertEqual(out["summary"]["min"], 3.0)
@@ -571,6 +589,17 @@ class ServerTelemetryTest(unittest.TestCase):
         # Read half the lag late, like the snapshot block.
         active(lag_s=70)
         self.assertEqual(mock_range.call_args.args[2:4], (135, 165))
+
+        # A reported 0 is not hosting, in the points and in per_atelet.
+        mock_range.return_value = [
+            {"metric": {"instance": "a"}, "values": [[100, "0"], [110, "2"]]},
+            {"metric": {"instance": "b"}, "values": [[100, "3"], [110, "0"]]},
+        ]
+        out = active()
+        self.assertEqual([p["active_atelets"] for p in out["timeseries"]][:2],
+                         [1, 1])
+        self.assertEqual((out["per_atelet"]["min"], out["per_atelet"]["max"]),
+                         (2.0, 3.0))
 
         # Never seen (not scraped) is unmeasured, not zero.
         mock_range.return_value = []
