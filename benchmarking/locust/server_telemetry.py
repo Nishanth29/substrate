@@ -479,7 +479,7 @@ def _harvest_snapshots(
     }
 
 
-def _harvest_active_actors(
+def _count_active_actors(
     prom_url: str,
     start_ts: int,
     end_ts: int,
@@ -488,6 +488,13 @@ def _harvest_active_actors(
     lag_s: int = 0,
 ) -> dict[str, Any]:
     """Running actors over the run, cluster-wide and per atelet.
+
+    `summary` is percentiles of the cluster-wide total, and `per_atelet` of
+    each atelet's count while it hosts an actor, both over the steady window.
+    `timeseries` covers the whole run, ramp-up included: every 10s, the total,
+    `active_atelets` hosting an actor, and `per_atelet_<stat>` across them
+    (null when none). Percentiles are nearest rank, so with few atelets p50
+    can equal max.
 
     The atelet drops a template's series when its last actor on the node
     leaves, so a sample with no series is zero actors, provided the metric was
@@ -528,14 +535,25 @@ def _harvest_active_actors(
     # Range query samples land on first + k * step.
     points, steady_totals = [], []
     for t in range(first, last + 1, 10):
-        total = sum(s.get(t, 0.0) for s in by_atelet.values())
-        points.append({"timestamp": t, "active_actors": total})
+        counts = [s.get(t, 0.0) for s in by_atelet.values()]
+        total = sum(counts)
+        # Only atelets hosting an actor, so idle nodes do not pull it to 0.
+        hosting = [v for v in counts if v > 0]
+        point: dict[str, Any] = {
+            "timestamp": t,
+            "active_actors": total,
+            "active_atelets": len(hosting),
+        }
+        point.update({
+            f"per_atelet_{k}": v
+            for k, v in compute_percentiles(hosting).items()
+        })
+        points.append(point)
         if steady_first <= t <= steady_last:
             steady_totals.append(total)
-    # Per atelet only while it hosts an actor, so idle nodes do not pull it to 0.
     per_atelet = [
         v for s in by_atelet.values() for t, v in s.items()
-        if steady_first <= t <= steady_last
+        if steady_first <= t <= steady_last and v > 0
     ]
     return {
         "summary": compute_percentiles(steady_totals),
@@ -573,7 +591,7 @@ def harvest_server_telemetry(
         "snapshots": _harvest_snapshots(
             prom_url, steady_start_ts, steady_end, lag_s
         ),
-        "active_actors": _harvest_active_actors(
+        "active_actors": _count_active_actors(
             prom_url, start_ts, end_ts, steady_start_ts, steady_end, lag_s
         ),
     }

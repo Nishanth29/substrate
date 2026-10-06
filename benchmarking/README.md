@@ -441,15 +441,18 @@ actually did, independent of what the load generator reported.
   actor from or to its own snapshot (`ate_actor_{restore,checkpoint}_duration`,
   `total` phase, kind `latest`). A template's first start (`golden`) and a
   pause (`local`) are left out. The buckets reach 60s, so a slower operation
-  reads as 60s.
+  reads as 60s. Runs before this read the AteomHerder RPC duration, capped at
+  10s.
 * `snapshots.checkpoints_in_window`, `checkpoints_cumulative`: checkpoint
   volume over the steady-state window, and since the atelet started.
 * `snapshots.checkpoint_mb_s`: bytes written per second spent checkpointing,
   not per second of wall clock.
 * `active_actors`: running actors (`ate_actor_stats_sampled_actors`), as a
   percentile `summary` of the cluster-wide count, `per_atelet` percentiles
-  over the samples where a node hosted an actor, `atelets` seen, and the
-  cluster-wide `timeseries` every 10s over the run. As the assumptions above
+  over the samples where a node hosted an actor, `atelets` seen, and a
+  `timeseries` every 10s over the whole run (ramp-up included). Each point has
+  the cluster-wide count, `active_atelets` hosting an actor, and
+  `per_atelet_<stat>` across them (null when none). As the assumptions above
   note, the gauge drops actors without a live measurement, so suspended ones
   fall out and the count dips while actors are suspended. A sample with no
   series counts as 0, since the atelet stops exporting when a node has no
