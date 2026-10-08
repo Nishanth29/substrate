@@ -16,7 +16,7 @@
 
 Queries Prometheus over [T_start, T_end] and the steady-state window inside it
 to capture cluster packing, node and pod PSI stalls, snapshot sizes, latencies
-and throughput, and running actors.
+and throughput, running actors and memory working set.
 """
 
 import csv
@@ -26,6 +26,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -562,6 +563,140 @@ def _count_active_actors(
     }
 
 
+# Live worker pods: the rate drops a deleted pod's stale series in ~1 min, not 5.
+WORKER_PODS = (
+    "rate(container_cpu_usage_seconds_total"
+    '{namespace="benchmark-workloads", container="ateom"}[1m]) > 0'
+)
+
+# Only nodes/pods with a live worker; max, not sum: a restart briefly has 2 series.
+WORKING_SET_QUERIES = {
+    "node": (
+        'max by (instance) (container_memory_working_set_bytes{container="node"})'
+        f" and on (instance) count by (instance) ({WORKER_PODS})"
+    ),
+    "ateom": (
+        "max by (pod) (container_memory_working_set_bytes"
+        '{namespace="benchmark-workloads", container="ateom"})'
+        f" and on (pod) ({WORKER_PODS})"
+    ),
+    "atelet": (
+        "max by (pod, instance) (container_memory_working_set_bytes"
+        '{namespace="ate-system", container="atelet"})'
+        f" and on (instance) count by (instance) ({WORKER_PODS})"
+    ),
+}
+
+# Actors' working set and running count per atelet, all templates summed; keyed
+# like packing and active_actors. Not node names, so no worker filter: the
+# atelet stops exporting on a node with no running actor.
+ACTOR_WORKING_SET = (
+    "sum by (instance, exported_instance) (ate_actor_stats_memory_working_set_bytes)"
+)
+ACTOR_COUNT = "sum by (instance, exported_instance) (ate_actor_stats_sampled_actors)"
+WORKING_SET_KEYS = (*WORKING_SET_QUERIES, "actor", "per_actor")
+
+BYTES_PER_GIB = 2**30
+
+
+def _label_key(metric: dict[str, str]) -> tuple:
+    """Every label, so each series keeps its own key."""
+    return tuple(sorted(metric.items()))
+
+
+def _read_series(
+    prom_url: str, query: str, start_ts: int, end_ts: int, shift: int = 0,
+    key: Callable[[dict[str, str]], Any] = _label_key,
+) -> dict[Any, dict[int, float]]:
+    """Samples per `key` every 10s, read `shift` late and moved back by it.
+
+    Series sharing a key describe the same thing, so they merge by max.
+    """
+    res = query_prometheus_range(
+        prom_url, query, start_ts + shift, end_ts + shift, step="10s"
+    )
+    out: dict[Any, dict[int, float]] = {}
+    for series in res:
+        new = _series_samples(series)
+        if not new:
+            continue
+        samples = out.setdefault(key(series.get("metric", {})), {})
+        for t, val in new.items():
+            samples[t - shift] = max(samples.get(t - shift, val), val)
+    return out
+
+
+def _summarize_gb(
+    series: dict[Any, dict[int, float]],
+    steady_start_ts: int,
+    steady_end_ts: int,
+) -> dict[str, Any]:
+    """Steady percentiles, series seen in steady, and a 10s sum/max timeseries."""
+    by_ts: dict[int, list[float]] = {}
+    steady_gb: list[float] = []
+    steady_series = 0
+    for samples in series.values():
+        in_steady = False
+        for t, val in samples.items():
+            gb = val / BYTES_PER_GIB
+            by_ts.setdefault(t, []).append(gb)
+            if steady_start_ts <= t <= steady_end_ts:
+                steady_gb.append(gb)
+                in_steady = True
+        steady_series += in_steady
+    return {
+        "summary": compute_percentiles(steady_gb),
+        "count": steady_series if by_ts else None,
+        "timeseries": [
+            {
+                "timestamp": t,
+                "total_gb": round(sum(v), 4),
+                "max_gb": round(max(v), 4),
+            }
+            for t, v in sorted(by_ts.items())
+        ],
+    }
+
+
+def _measure_working_set(
+    prom_url: str,
+    start_ts: int,
+    end_ts: int,
+    steady_start_ts: int,
+    steady_end_ts: int,
+    lag_s: int = 0,
+) -> dict[str, Any]:
+    """Working set GiB per node, ateom, atelet and actor; null, not 0, with no series.
+
+    `ateom` is the whole worker pod, every actor on it included. `actor` is the
+    atelet's sum over the actors it measured, per atelet; `per_actor` divides it
+    by their count. The atelet samples about once a minute and exports late, so
+    both are read `lag_s // 2` late and moved back onto the run's 10s grid.
+    """
+    def summarize(series: dict[Any, dict[int, float]]) -> dict[str, Any]:
+        return _summarize_gb(series, steady_start_ts, steady_end_ts)
+
+    out: dict[str, Any] = {
+        key: summarize(_read_series(prom_url, query, start_ts, end_ts))
+        for key, query in WORKING_SET_QUERIES.items()
+    }
+    shift = lag_s // 2
+    actor = _read_series(
+        prom_url, ACTOR_WORKING_SET, start_ts, end_ts, shift, key=_process_key
+    )
+    count = _read_series(
+        prom_url, ACTOR_COUNT, start_ts, end_ts, shift, key=_process_key
+    )
+    out["actor"] = summarize(actor)
+    # Same atelet and timestamp; a missing or zero count is skipped.
+    out["per_actor"] = summarize({
+        key: {t: v / count[key][t] for t, v in samples.items()
+              if count.get(key, {}).get(t)}
+        for key, samples in actor.items()
+    })
+    return out
+
+
 def harvest_server_telemetry(
     prom_url: str,
     start_ts: int,
@@ -572,9 +707,9 @@ def harvest_server_telemetry(
 ) -> dict[str, Any]:
     """Harvests the ground truth metric streams from Prometheus.
 
-    Only the atelet-exported snapshot and active actor blocks are read late, by
-    `lag_s // 2`; packing and PSI aren't shifted and are read over the run
-    window as is.
+    Only the atelet-exported snapshot, active actor and actor working set
+    blocks are read late, by `lag_s // 2`; packing, PSI and the cAdvisor
+    working set aren't shifted and are read over the run window as is.
     """
     steady_end = end_ts if steady_end_ts is None else steady_end_ts
     return {
@@ -591,6 +726,9 @@ def harvest_server_telemetry(
             prom_url, steady_start_ts, steady_end, lag_s
         ),
         "active_actors": _count_active_actors(
+            prom_url, start_ts, end_ts, steady_start_ts, steady_end, lag_s
+        ),
+        "working_set": _measure_working_set(
             prom_url, start_ts, end_ts, steady_start_ts, steady_end, lag_s
         ),
     }
@@ -689,6 +827,11 @@ def extract_and_record_server_telemetry(
     active = telemetry.get("active_actors", {}).get("summary", {})
     for p in ps:
         measurements[f"active_actors_{p}"] = active.get(p)
+    working_set = telemetry.get("working_set", {})
+    for block in WORKING_SET_KEYS:
+        ws = working_set.get(block, {}).get("summary", {})
+        for p in (*ps, "max"):
+            measurements[f"working_set_{block}_{p}_gb"] = ws.get(p)
 
     jsonl_row = {
         "timestamp": data_ts,

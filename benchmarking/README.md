@@ -92,7 +92,7 @@ Three flags control the optional post-run measurements described in
   Defaults to the in-cluster service installed by
   [Optional: Prometheus + Grafana](#optional-prometheus--grafana).
 * `--atelet-lag-s`: how long to wait after the run before reading the
-  atelet's snapshot and active actor metrics. Defaults to 70.
+  atelet's metrics. Defaults to 70.
 
 Test-specific flags are appended to the same command; see the sections below.
 
@@ -460,6 +460,26 @@ actually did, independent of what the load generator reported.
   nodes: the collector keeps an exited atelet's last value for about 5
   minutes, so a restart can briefly count twice, and an atelet scraped both
   directly and through a collector counts twice.
+* `working_set.node`, `ateom`, `atelet`: memory working set in GiB from
+  cAdvisor on the nodes hosting a worker pod, per worker pod (every actor on it
+  included), and per atelet on those nodes. Each has a percentile `summary`
+  (plus `max`) over the steady-state window, `count` of series seen in it, and
+  a `timeseries` every 10s over the whole run with the sum (`total_gb`) and
+  largest (`max_gb`). A spike shorter than 10s can be missed.
+* `working_set.actor`, `per_actor`: the same shape for the actors' own working
+  set as the atelet reports it (`ate_actor_stats_memory_working_set_bytes`),
+  per atelet with every template summed, and the average per measured actor
+  (`ate_actor_stats_sampled_actors`) on each atelet; `count` is atelet
+  processes, keyed like `active_actors`. As `per_actor` is an average per
+  atelet, its `max` is the highest atelet average, not the largest actor, and
+  its `total_gb` has no meaning. A gVisor actor is read from its sandbox cgroup
+  on the host, a microVM actor from inside the guest. As with `active_actors`,
+  suspended actors fall out, but through the telemetry-meter a series that
+  stops being exported keeps its last value for up to 5m. Missing samples are
+  skipped, not counted as 0. The atelet samples every
+  `--actor-stats-poll-interval` (default 1m), so these move in steps of a
+  minute or more. `actor` matches one worker pod's actors only when the node
+  runs one worker pod.
 
 Every distribution reports p50, p90, p95 and p99 over the steady-state window.
 The steady-state window runs from the first to the last Locust sample at 90% or
@@ -472,14 +492,15 @@ every 10s.
 
 The atelet exports before Prometheus scrapes it, so the harvest waits
 `--atelet-lag-s` seconds (default 70, enough for the OTel SDK's 60s default
-export and a 10s scrape) and reads the snapshot and `active_actors` windows
-half that late, stamping `active_actors` points back by the same amount. The
-window ends at the last full-load sample, so teardown suspends are left out.
+export and a 10s scrape) and reads the snapshot, `active_actors` and actor
+working set windows half that late, stamping `active_actors` and actor
+working set points back by the same amount. The window ends at the last
+full-load sample, so teardown suspends are left out.
 
-`metadata.start_ts` and `end_ts` bound the whole run, which the packing and
-`active_actors` timeseries cover. `steady_start_ts` and `steady_end_ts` bound
-the steady-state window. A flat subset of the numbers also goes into a
-`server_summary` row in `stats.jsonl`.
+`metadata.start_ts` and `end_ts` bound the whole run, which the packing,
+`active_actors` and `working_set` timeseries cover. `steady_start_ts` and
+`steady_end_ts` bound the steady-state window. A flat subset of the numbers
+also goes into a `server_summary` row in `stats.jsonl`.
 
 Neither the Kubernetes API nor Prometheus is required. If either is unreachable,
 or discovery was skipped, the affected fields are written as `null` and the run
