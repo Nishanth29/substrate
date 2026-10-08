@@ -448,16 +448,14 @@ actually did, independent of what the load generator reported.
 * `snapshots.checkpoint_mb_s`: bytes written per second spent checkpointing,
   not per second of wall clock.
 * `active_actors`: running actors (`ate_actor_stats_sampled_actors`), as a
-  percentile `summary` of the cluster-wide count, `per_atelet` percentiles
-  over the samples where a node hosted an actor, `atelets` seen, and a
+  percentile `summary` of the cluster-wide count, `atelets` seen, and a
   `timeseries` every 10s over the whole run (ramp-up included). Each point has
-  the cluster-wide count, `active_atelets` hosting an actor, and
-  `per_atelet_<stat>` across them (null when none). As the assumptions above
-  note, the gauge drops actors without a live measurement, so suspended ones
-  fall out and the count dips while actors are suspended. A sample with no
-  series counts as 0, since the atelet stops exporting when a node has no
-  running actor; if the metric never appeared during the run, every field is
-  `null`.
+  the cluster-wide count and `active_atelets` hosting an actor. As the
+  assumptions above note, the gauge drops actors without a live measurement,
+  so suspended ones fall out and the count dips while actors are suspended. A
+  sample with no series counts as 0, since the atelet stops exporting when a
+  node has no running actor; if the metric never appeared during the run,
+  every field is `null`.
 
 Every distribution reports p50, p90, p95 and p99 over the steady-state window.
 The steady-state window runs from the first to the last Locust sample at 90% or
