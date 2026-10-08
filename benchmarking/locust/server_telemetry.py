@@ -487,14 +487,11 @@ def _count_active_actors(
     steady_end_ts: int,
     lag_s: int = 0,
 ) -> dict[str, Any]:
-    """Running actors over the run, cluster-wide and per atelet.
+    """Running actors over the run, cluster-wide.
 
-    `summary` is percentiles of the cluster-wide total, and `per_atelet` of
-    each atelet's count while it hosts an actor, both over the steady window.
-    `timeseries` covers the whole run, ramp-up included: every 10s, the total,
-    `active_atelets` hosting an actor, and `per_atelet_<stat>` across them
-    (null when none). Percentiles are nearest rank, so with few atelets p50
-    can equal max.
+    `summary` is percentiles of the cluster-wide total over the steady window.
+    `timeseries` covers the whole run, ramp-up included: every 10s, the total
+    and `active_atelets` hosting an actor.
 
     The atelet drops a template's series when its last actor on the node
     leaves, so a sample with no series is zero actors, provided the metric was
@@ -527,7 +524,6 @@ def _count_active_actors(
     if not any(by_atelet.values()):
         return {
             "summary": compute_percentiles([]),
-            "per_atelet": compute_percentiles([]),
             "atelets": None,
             "timeseries": [],
         }
@@ -537,27 +533,15 @@ def _count_active_actors(
     for t in range(first, last + 1, 10):
         counts = [s.get(t, 0.0) for s in by_atelet.values()]
         total = sum(counts)
-        # Only atelets hosting an actor, so idle nodes do not pull it to 0.
-        hosting = [v for v in counts if v > 0]
-        point: dict[str, Any] = {
+        points.append({
             "timestamp": t,
             "active_actors": total,
-            "active_atelets": len(hosting),
-        }
-        point.update({
-            f"per_atelet_{k}": v
-            for k, v in compute_percentiles(hosting).items()
+            "active_atelets": sum(1 for v in counts if v > 0),
         })
-        points.append(point)
         if steady_first <= t <= steady_last:
             steady_totals.append(total)
-    per_atelet = [
-        v for s in by_atelet.values() for t, v in s.items()
-        if steady_first <= t <= steady_last and v > 0
-    ]
     return {
         "summary": compute_percentiles(steady_totals),
-        "per_atelet": compute_percentiles(per_atelet),
         "atelets": len(by_atelet),
         "timeseries": points,
     }

@@ -556,30 +556,15 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertEqual((out["summary"]["min"], out["summary"]["max"]),
                          (0.0, 4.0))
         self.assertEqual(out["atelets"], 2)
-        # Only samples where an atelet hosts an actor.
-        self.assertEqual((out["per_atelet"]["min"], out["per_atelet"]["max"]),
-                         (1.0, 4.0))
         query = mock_range.call_args.args[1]
         self.assertIn("sum by (instance, exported_instance)", query)
         self.assertIn("ate_actor_stats_sampled_actors", query)
 
-        # Per point, across the atelets hosting an actor at that moment.
-        p100, p110, p120, p130 = out["timeseries"]
-        self.assertEqual(p100["active_atelets"], 2)
-        # Nearest rank: [1, 2] gives p50 2, while avg is the true mean.
-        self.assertEqual((p100["per_atelet_min"], p100["per_atelet_p50"],
-                          p100["per_atelet_max"], p100["per_atelet_avg"]),
-                         (1.0, 2.0, 2.0, 1.5))
-        self.assertEqual((p110["active_atelets"], p110["per_atelet_p50"]),
-                         (2, 3.0))
-        # No atelet hosting: same keys, all null.
-        self.assertEqual(p120["active_atelets"], 0)
-        self.assertTrue(all(
-            p120[f"per_atelet_{k}"] is None for k in NO_PERCENTILES))
-        # b dropped out, so only a counts (the sweperf case).
-        self.assertEqual(p130["active_atelets"], 1)
-        self.assertTrue(all(
-            p130[f"per_atelet_{k}"] == 4.0 for k in NO_PERCENTILES))
+        # Atelets hosting an actor at each point; b drops out at 130.
+        self.assertEqual([p["active_atelets"] for p in out["timeseries"]],
+                         [2, 2, 0, 1])
+        self.assertEqual(set(out["timeseries"][0]),
+                         {"timestamp", "active_actors", "active_atelets"})
 
         # The steady window bounds the summary but not the timeseries.
         out = active(steady=(100, 110))
@@ -590,7 +575,7 @@ class ServerTelemetryTest(unittest.TestCase):
         active(lag_s=70)
         self.assertEqual(mock_range.call_args.args[2:4], (135, 165))
 
-        # A reported 0 is not hosting, in the points and in per_atelet.
+        # A reported 0 is not hosting.
         mock_range.return_value = [
             {"metric": {"instance": "a"}, "values": [[100, "0"], [110, "2"]]},
             {"metric": {"instance": "b"}, "values": [[100, "3"], [110, "0"]]},
@@ -598,8 +583,6 @@ class ServerTelemetryTest(unittest.TestCase):
         out = active()
         self.assertEqual([p["active_atelets"] for p in out["timeseries"]][:2],
                          [1, 1])
-        self.assertEqual((out["per_atelet"]["min"], out["per_atelet"]["max"]),
-                         (2.0, 3.0))
 
         # Never seen (not scraped) is unmeasured, not zero.
         mock_range.return_value = []
