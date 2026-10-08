@@ -86,7 +86,8 @@ Three flags control the optional post-run measurements described in
 [Benchmark output files](#benchmark-output-files):
 
 * `--cluster-facts` / `--no-cluster-facts`: read node capacity and worker pod
-  count from the Kubernetes API once the run ends, to derive density frontiers.
+  count from the Kubernetes API once the run ends, to derive density frontiers,
+  and worker pod restarts and evictions around the run, for `oom_events`.
   On by default. Pass `--no-cluster-facts` to skip Kubernetes API discovery.
 * `--prometheus-url`: the Prometheus to harvest server-side telemetry from.
   Defaults to the in-cluster service installed by
@@ -480,6 +481,29 @@ actually did, independent of what the load generator reported.
   `--actor-stats-poll-interval` (default 1m), so these move in steps of a
   minute or more. `actor` matches one worker pod's actors only when the node
   runs one worker pod.
+* `oom_events.node`, `pod`: OOM kills over the run, from cAdvisor's
+  `container_oom_events_total`. `node` counts only global OOMs. `pod` counts
+  kills inside a worker pod (actor sandboxes and the ateom container) and is
+  best effort: a non-zero value is real, but a kill whose cgroup is gone before
+  the scrape is missed. A node-allocatable OOM (`oom_memcg=/kubepods.slice`)
+  isn't global, so it isn't in `node`, and `pod` usually misses it; the kubelet
+  evictions that often come with it show in `evicted`. OOMs inside a microVM
+  guest are invisible and show up as task failures. Memory PSI (`node_psi` /
+  `pod_psi`) is the early warning.
+* `oom_events.worker_restarts`, `worker_oomkilled_pods`, `evicted`,
+  `worker_pods_lost`: from the Kubernetes API, read before and after the run.
+  Restarts on a pod deleted during the run are lost. `worker_oomkilled_pods`
+  counts pods whose last restart was `OOMKilled`, not kills; a group kill of
+  the whole worker (`memory.oom.group=1`) shows here. `evicted` is kubelet
+  eviction under node pressure (usually memory), not a kernel OOM kill. It also
+  counts replacement pods the kubelet refused to start while the node was under
+  pressure, as they get the same `Evicted` reason. It comes from `Evicted`
+  events, which last about 1h, so a run longer than that can undercount.
+  `worker_pods_lost` is pods gone by the end for any reason (eviction,
+  scale-down, recycling), not an OOM count; a pod created and deleted within
+  the run isn't counted. A node OOM can also show as a worker `OOMKilled`
+  restart, so never add the fields. A field is `null` when its Kubernetes read
+  fails, and all are with `--no-cluster-facts`.
 
 Every distribution reports p50, p90, p95 and p99 over the steady-state window.
 The steady-state window runs from the first to the last Locust sample at 90% or

@@ -16,7 +16,7 @@
 
 Queries Prometheus over [T_start, T_end] and the steady-state window inside it
 to capture cluster packing, node and pod PSI stalls, snapshot sizes, latencies
-and throughput, running actors and memory working set.
+and throughput, running actors, memory working set and OOM kills.
 """
 
 import csv
@@ -697,6 +697,60 @@ def _measure_working_set(
     return out
 
 
+# A global OOM logs no oom_memcg, so cAdvisor counts it on `/` (container="node").
+OOM_NODE = 'container="node"'
+# Kills in a worker pod: nested actor sandbox cgroups, then ateom's own cgroup.
+OOM_POD = (
+    r'pod="", id=~".*/cri-containerd-[^/]+\\.scope/.+"',
+    'namespace="benchmark-workloads", container="ateom"',
+)
+
+
+def _oom_growth_query(selector: str, start_ts: int, window_s: int) -> str:
+    """OOMs in the window, clamped per series; `or vector(0)` so [] = failed read."""
+    s = f"container_oom_events_total{{{selector}}}"
+    peak = f"max_over_time({s}[{window_s}s])"
+    return f"sum(clamp_min({peak} - ({s} @ {start_ts} or {peak} * 0), 0)) or vector(0)"
+
+
+# From the Kubernetes API, read in runner.py.
+WORKER_POD_FIELDS = (
+    "worker_restarts", "worker_oomkilled_pods", "evicted", "worker_pods_lost",
+)
+
+
+def _count_oom_events(prom_url: str, start_ts: int, end_ts: int) -> dict[str, Any]:
+    """OOM kills over the run; a failed read is null, not 0.
+
+    `node` counts global OOMs only. `pod` is best effort: a kill counts only if
+    its cgroup lasts until the scrape, so it usually misses a node-allocatable
+    OOM and a group kill of the whole worker, but a non-zero value is real.
+    """
+    window_s = max(end_ts - start_ts, 1)
+    out: dict[str, Any] = {
+        "node": None,
+        "pod": None,
+        "window": {"start_ts": start_ts, "end_ts": end_ts},
+    }
+    if not query_prometheus_instant(
+        prom_url, "count(container_oom_events_total)", time_ts=end_ts
+    ):
+        return out  # Metric not scraped.
+
+    def grown(selector: str) -> int | None:
+        v = _parse_instant_float(query_prometheus_instant(
+            prom_url, _oom_growth_query(selector, start_ts, window_s),
+            time_ts=end_ts,
+        ))
+        return None if v is None else int(round(v))
+
+    out["node"] = grown(OOM_NODE)
+    # Two reads, as `@` takes a selector, not (A or B); half a read is no read.
+    pod = [grown(sel) for sel in OOM_POD]
+    out["pod"] = None if None in pod else sum(pod)
+    return out
+
+
 def harvest_server_telemetry(
     prom_url: str,
     start_ts: int,
@@ -708,8 +762,8 @@ def harvest_server_telemetry(
     """Harvests the ground truth metric streams from Prometheus.
 
     Only the atelet-exported snapshot, active actor and actor working set
-    blocks are read late, by `lag_s // 2`; packing, PSI and the cAdvisor
-    working set aren't shifted and are read over the run window as is.
+    blocks are read late, by `lag_s // 2`; packing, PSI, the cAdvisor working
+    set and OOM counts aren't shifted and are read over the run window as is.
     """
     steady_end = end_ts if steady_end_ts is None else steady_end_ts
     return {
@@ -731,6 +785,7 @@ def harvest_server_telemetry(
         "working_set": _measure_working_set(
             prom_url, start_ts, end_ts, steady_start_ts, steady_end, lag_s
         ),
+        "oom_events": _count_oom_events(prom_url, start_ts, end_ts),
     }
 
 
@@ -746,11 +801,13 @@ def extract_and_record_server_telemetry(
     test_name: str,
     logs: TextIO | None = None,
     lag_s: int = 70,
+    worker_pods: dict[str, int | None] | None = None,
 ) -> None:
     """Entry point called by runner.py to query Prometheus and persist artifacts.
 
     Waits until `end_ts + lag_s` first, so the atelet's last export of the run
     has been scraped; lag_s must cover its export interval plus one scrape.
+    `worker_pods` (WORKER_POD_FIELDS) joins `oom_events`; null when not given.
     """
     def log(msg: str) -> None:
         if logs:
@@ -775,6 +832,9 @@ def extract_and_record_server_telemetry(
     telemetry = harvest_server_telemetry(
         prom_url, start_ts, end_ts, steady_start, lag_s,
         steady_end_ts=steady_end,
+    )
+    telemetry.setdefault("oom_events", {}).update(
+        {k: (worker_pods or {}).get(k) for k in WORKER_POD_FIELDS}
     )
 
     full_artifact = {
@@ -832,6 +892,9 @@ def extract_and_record_server_telemetry(
         ws = working_set.get(block, {}).get("summary", {})
         for p in (*ps, "max"):
             measurements[f"working_set_{block}_{p}_gb"] = ws.get(p)
+    oom = telemetry.get("oom_events", {})
+    for key in ("node", "pod", *WORKER_POD_FIELDS):
+        measurements[f"oom_events_{key}"] = oom.get(key)
 
     jsonl_row = {
         "timestamp": data_ts,
