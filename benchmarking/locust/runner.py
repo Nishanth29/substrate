@@ -160,10 +160,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=70,
         help=(
-            "Seconds to wait after the run, and to shift the snapshot window "
-            "by, so the atelet's last export is scraped. Must cover the "
-            "atelet's OTEL_METRIC_EXPORT_INTERVAL plus one Prometheus scrape; "
-            "the default fits the OTel SDK's 60s default export and a 10s scrape"
+            "Seconds to wait after the run, so the atelet's last export is "
+            "scraped; its snapshot and active actor windows are read half this "
+            "late. Must cover the atelet's OTEL_METRIC_EXPORT_INTERVAL plus one "
+            "Prometheus scrape; the default fits the OTel SDK's 60s default export "
+            "and a 10s scrape"
         ),
     )
     args, extra = p.parse_known_args()

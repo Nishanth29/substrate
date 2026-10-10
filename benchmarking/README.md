@@ -92,7 +92,7 @@ Three flags control the optional post-run measurements described in
   Defaults to the in-cluster service installed by
   [Optional: Prometheus + Grafana](#optional-prometheus--grafana).
 * `--atelet-lag-s`: how long to wait after the run before reading the
-  atelet's snapshot metrics. Defaults to 70.
+  atelet's snapshot and active actor metrics. Defaults to 70.
 
 Test-specific flags are appended to the same command; see the sections below.
 
@@ -438,11 +438,10 @@ actually did, independent of what the load generator reported.
 * `snapshots.size_avg_mb`: mean memory image size.
 * `snapshots.restore_p50_s` through `restore_p99_s`, `restore_mean_s`, and the
   same for `checkpoint_*`: how long the atelet took to resume or suspend an
-  actor from or to its own snapshot (`ate_actor_{restore,checkpoint}_duration`,
-  `total` phase, kind `latest`). A template's first start (`golden`) and a
-  pause (`local`) are left out. The buckets reach 60s, so a slower operation
-  reads as 60s. Runs before this read the AteomHerder RPC duration, capped at
-  10s.
+  actor (`ate_actor_{restore,checkpoint}_duration`, `total` phase). Every
+  snapshot kind counts, as in the sizes: the actor's own snapshot, a
+  template's first start from its golden snapshot, and a pause. The buckets
+  reach 60s, so a slower operation reads as 60s.
 * `snapshots.checkpoints_in_window`, `checkpoints_cumulative`: checkpoint
   volume over the steady-state window, and since the atelet started.
 * `snapshots.checkpoint_mb_s`: bytes written per second spent checkpointing,
@@ -452,10 +451,15 @@ actually did, independent of what the load generator reported.
   `timeseries` every 10s over the whole run (ramp-up included). Each point has
   the cluster-wide count and `active_atelets` hosting an actor. As the
   assumptions above note, the gauge drops actors without a live measurement,
-  so suspended ones fall out and the count dips while actors are suspended. A
-  sample with no series counts as 0, since the atelet stops exporting when a
-  node has no running actor; if the metric never appeared during the run,
-  every field is `null`.
+  so suspended ones fall out and the count dips while actors are suspended.
+  The atelet stops exporting when a node has no running actor, so at a step
+  where at least one atelet reported, a missing one counts as 0. A step where
+  none reported is skipped, not 0, since a failed scrape looks the same; this
+  mostly hits 1-user runs. If the metric never appeared during the run, every
+  field is `null`. `atelets` counts atelet processes seen in the run, not
+  nodes: the collector keeps an exited atelet's last value for about 5
+  minutes, so a restart can briefly count twice, and an atelet scraped both
+  directly and through a collector counts twice.
 
 Every distribution reports p50, p90, p95 and p99 over the steady-state window.
 The steady-state window runs from the first to the last Locust sample at 90% or
@@ -468,13 +472,13 @@ every 10s.
 
 The atelet exports before Prometheus scrapes it, so the harvest waits
 `--atelet-lag-s` seconds (default 70, enough for the OTel SDK's 60s default
-export and a 10s scrape)
-and reads the snapshot and `active_actors` windows half that late. The window
-ends at the last full-load sample, so teardown suspends are left out.
+export and a 10s scrape) and reads the snapshot and `active_actors` windows
+half that late, stamping `active_actors` points back by the same amount. The
+window ends at the last full-load sample, so teardown suspends are left out.
 
-`metadata.start_ts` and `end_ts` bound the whole run, which the packing
-`timeseries` covers. `steady_start_ts` and `steady_end_ts` bound the
-steady-state window. A flat subset of the numbers also goes into a
+`metadata.start_ts` and `end_ts` bound the whole run, which the packing and
+`active_actors` timeseries cover. `steady_start_ts` and `steady_end_ts` bound
+the steady-state window. A flat subset of the numbers also goes into a
 `server_summary` row in `stats.jsonl`.
 
 Neither the Kubernetes API nor Prometheus is required. If either is unreachable,
