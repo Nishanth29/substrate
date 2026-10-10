@@ -86,21 +86,18 @@ MB = 1024 * 1024
 # The memory image selector: pages.img (gVisor) or memory-ranges (microVM).
 MEMORY_IMAGE = '{file_name=~"pages.img|memory-ranges"}'
 
-# A whole suspend or resume of the actor's own snapshot.
-SNAPSHOT_OP = '{ate_snapshot_phase="total",ate_snapshot_kind="latest"}'
+# A whole suspend or resume, every snapshot kind.
+SNAPSHOT_OP = '{ate_snapshot_phase="total"}'
 
 # Each cumulative sum _harvest_snapshots reads, by a substring of its query.
 SUMS = {
     "count": "atelet_snapshot_size_bytes_count" + MEMORY_IMAGE,
     "size": "atelet_snapshot_size_bytes_sum" + MEMORY_IMAGE,
     "bytes": "sum(atelet_snapshot_size_bytes_sum)",
-    # Every kind, for checkpoint_mb_s. The closing brace keeps it from also
-    # matching the kind="latest" selector below.
-    "seconds":
-        'ate_actor_checkpoint_duration_seconds_sum{ate_snapshot_phase="total"}',
+    # Checkpoint seconds: both checkpoint_mb_s and checkpoint_mean_s read it.
+    "seconds": "ate_actor_checkpoint_duration_seconds_sum" + SNAPSHOT_OP,
     "restore_sum": "ate_actor_restore_duration_seconds_sum" + SNAPSHOT_OP,
     "restore_count": "ate_actor_restore_duration_seconds_count" + SNAPSHOT_OP,
-    "checkpoint_sum": "ate_actor_checkpoint_duration_seconds_sum" + SNAPSHOT_OP,
     "checkpoint_count":
         "ate_actor_checkpoint_duration_seconds_count" + SNAPSHOT_OP,
 }
@@ -131,14 +128,15 @@ def snapshot_prom(quantile=None, start=None, end=None, at=(100, 105)):
 
 
 def history_csv(rows):
-    """A stats_history.csv built from (timestamp, user count) pairs."""
+    """A stats_history.csv from (timestamp, users) or (timestamp, users, name)."""
     f = tempfile.NamedTemporaryFile(
         "w", delete=False, suffix=".csv", encoding="utf-8"
     )
     writer = csv.DictWriter(f, fieldnames=["Timestamp", "Name", "User Count"])
     writer.writeheader()
-    for ts, users in rows:
-        writer.writerow({"Timestamp": ts, "Name": "Aggregated", "User Count": users})
+    for ts, users, *name in rows:
+        writer.writerow({"Timestamp": ts, "Name": name[0] if name else "Aggregated",
+                         "User Count": users})
     f.close()
     return Path(f.name)
 
@@ -249,11 +247,11 @@ class ServerTelemetryTest(unittest.TestCase):
         mock_instant.side_effect = snapshot_prom(
             "11.5",
             start={"count": "100", "size": "0", "restore_sum": "0",
-                   "restore_count": "0", "checkpoint_sum": "0",
+                   "restore_count": "0", "seconds": "0",
                    "checkpoint_count": "0"},
             end={"count": "150", "size": str(100 * MB), "bytes": str(100 * MB),
                  "seconds": "50", "restore_sum": "4", "restore_count": "8",
-                 "checkpoint_sum": "100", "checkpoint_count": "50"},
+                 "checkpoint_count": "25"},
             at=(135, 140))
 
         with tempfile.TemporaryDirectory() as td:
@@ -515,13 +513,13 @@ class ServerTelemetryTest(unittest.TestCase):
 
     @mock.patch("server_telemetry.query_prometheus_instant")
     def test_restore_and_checkpoint_read_atelet_histograms(self, mock_instant):
-        # Above the RPC histogram's 10s top bucket, which these replace.
+        # 42s, above 10s: the buckets reach 60s.
         mock_instant.side_effect = snapshot_prom(
             "42.0",
             start={"restore_sum": "0", "restore_count": "0",
-                   "checkpoint_sum": "0", "checkpoint_count": "0"},
+                   "seconds": "0", "checkpoint_count": "0"},
             end={"restore_sum": "300", "restore_count": "10",
-                 "checkpoint_sum": "40", "checkpoint_count": "20"})
+                 "seconds": "40", "checkpoint_count": "20"})
         snaps = snapshots()
         self.assertEqual(snaps["restore_p99_s"], 42.0)
         self.assertEqual(snaps["checkpoint_p50_s"], 42.0)
@@ -535,6 +533,8 @@ class ServerTelemetryTest(unittest.TestCase):
                 q.startswith("histogram_quantile")
                 and f"ate_actor_{op}_duration_seconds_bucket{SNAPSHOT_OP}" in q
                 for q in queries))
+        # Every kind, like the sizes, which have no kind label.
+        self.assertFalse(any("ate_snapshot_kind" in q for q in queries))
 
     @mock.patch("server_telemetry.query_prometheus_range")
     def test_active_actors(self, mock_range):
@@ -542,7 +542,8 @@ class ServerTelemetryTest(unittest.TestCase):
             return server_telemetry._count_active_actors(
                 "http://localhost:9090", 100, 130, *steady, lag_s=lag_s)
 
-        # Two atelets; at 120 neither has an actor, so no series at all.
+        # At 120 no atelet reported, so the step is skipped; at 130 only a
+        # did, so b's missing series counts as 0.
         mock_range.return_value = [
             {"metric": {"instance": "a"},
              "values": [[100, "2"], [110, "3"], [130, "4"]]},
@@ -550,11 +551,11 @@ class ServerTelemetryTest(unittest.TestCase):
         ]
         out = active()
         self.assertEqual([p["active_actors"] for p in out["timeseries"]],
-                         [3.0, 4.0, 0.0, 4.0])
+                         [3.0, 4.0, 4.0])
         self.assertEqual([p["timestamp"] for p in out["timeseries"]],
-                         [100, 110, 120, 130])
+                         [100, 110, 130])
         self.assertEqual((out["summary"]["min"], out["summary"]["max"]),
-                         (0.0, 4.0))
+                         (3.0, 4.0))
         self.assertEqual(out["atelets"], 2)
         query = mock_range.call_args.args[1]
         self.assertIn("sum by (instance, exported_instance)", query)
@@ -562,18 +563,33 @@ class ServerTelemetryTest(unittest.TestCase):
 
         # Atelets hosting an actor at each point; b drops out at 130.
         self.assertEqual([p["active_atelets"] for p in out["timeseries"]],
-                         [2, 2, 0, 1])
+                         [2, 2, 1])
         self.assertEqual(set(out["timeseries"][0]),
                          {"timestamp", "active_actors", "active_atelets"})
 
         # The steady window bounds the summary but not the timeseries.
         out = active(steady=(100, 110))
         self.assertEqual(out["summary"]["min"], 3.0)
-        self.assertEqual(len(out["timeseries"]), 4)
+        self.assertEqual(len(out["timeseries"]), 3)
 
-        # Read half the lag late, like the snapshot block.
-        active(lag_s=70)
+        # Read half the lag late, like the snapshot block, but stamped back
+        # onto the run's clock; the steady window still picks the late reads.
+        mock_range.return_value = [{"metric": {"instance": "a"},
+                                    "values": [[135, "3"], [145, "5"]]}]
+        out = active(lag_s=70, steady=(100, 100))
         self.assertEqual(mock_range.call_args.args[2:4], (135, 165))
+        self.assertEqual([p["timestamp"] for p in out["timeseries"]], [100, 110])
+        self.assertEqual(out["summary"]["max"], 3.0)
+
+        # One atelet re-exported by 2 collector replicas merges by max, not sum.
+        mock_range.return_value = [
+            {"metric": {"instance": f"meter-{i}", "exported_instance": "a"},
+             "values": [[100, "3"], [110, v]]} for i, v in ((0, "2"), (1, "3"))
+        ]
+        out = active()
+        self.assertEqual([p["active_actors"] for p in out["timeseries"]],
+                         [3.0, 3.0])
+        self.assertEqual(out["atelets"], 1)
 
         # A reported 0 is not hosting.
         mock_range.return_value = [
@@ -591,14 +607,18 @@ class ServerTelemetryTest(unittest.TestCase):
         self.assertIsNone(out["atelets"])
         self.assertEqual(out["timeseries"], [])
 
+    def test_series_samples_skips_bad_points(self):
+        series = {"values": [[100, "1"], [110, "NaN"], [120, "+Inf"],
+                             [130, "-Inf"], [140], [150, None], ["x", "2"],
+                             [160, "2.5"]]}
+        self.assertEqual(server_telemetry._series_samples(series),
+                         {100: 1.0, 160: 2.5})
+        self.assertEqual(server_telemetry._series_samples({}), {})
+
     def test_steady_window_ignores_per_request_rows(self):
         # --csv-full-history adds a row per operation; only Aggregated counts.
-        with tempfile.NamedTemporaryFile(
-                "w", delete=False, suffix=".csv", encoding="utf-8") as f:
-            f.write("Timestamp,User Count,Type,Name\n"
-                    "100,5,,Aggregated\n100,500,grpc,ResumeActor\n"
-                    "110,10,,Aggregated\n110,500,grpc,ResumeActor\n")
-        path = Path(f.name)
+        path = history_csv([("100", "5"), ("100", "500", "ResumeActor"),
+                            ("110", "10"), ("110", "500", "ResumeActor")])
         try:
             self.assertEqual(
                 server_telemetry.get_steady_state_window(path, 100, 150),
