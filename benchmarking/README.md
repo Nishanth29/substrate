@@ -240,6 +240,29 @@ When the run ends, shutdown cancels cycles still in flight. Calls cut short this
 nothing, and the interrupted task records no `TaskCEL` or `TaskWallClock` row, so the end of
 a run does not show up as a burst of failures.
 
+#### Sweperf Log Lines
+
+The boomer log also carries per-task facts for post-processing such as the goodput script in
+`tools/goodput`, which decides from them whether a task was good. The benchmark judges
+nothing. Durations are in milliseconds.
+
+* `Completed sweperf cycle`: `actor`, `cycle`, `cel_ms` (0 when the execute failed),
+  `wall_ms` (resume start to cycle end), `ok` (the execute succeeded, and so did the suspend
+  if there was one), `resume_ms` (as on the `ResumeActor` row; omitted for a no-op resume)
+  and `ttfe_ms` (resume start to the asynchronous ack; omitted without one).
+* `ResumeActor failed in step`: also carries `wall_ms`. The cycle is retried on the next
+  iteration, and the failed attempt's time counts toward the task's `wall_ms`.
+* `sweperf task record`, one per finished task: `v` (1), `user` (boomer goroutine ID, unique
+  per boomer process), `actor`, `template`, `task_start` (before `CreateAtespace`) and `end`,
+  `startup_ms` (`CreateActor` until the sandbox answers `/status`), `cel_ms` and `wall_ms`
+  (as in `TaskCEL` and `TaskWallClock`), `think_ms` (think time between the task's cycles),
+  `resume_max_ms` (slowest non-no-op resume), `ttfe_max_ms` (omitted when no cycle got an
+  asynchronous ack), `retries` (failed resumes), `failed`, and the first failure's
+  `fail_step` (`resume`, `execute` or `suspend`) and `fail_cycle`.
+* `sweperf on_start failed`: also carries `user`, to tie a failed start to its user.
+* `sweperf shutdown started`: the worker began tearing down. Cycles in flight are canceled,
+  so records and startup failures logged after it belong to the teardown, not the run.
+
 ### Agent-Session Benchmark
 
 The agent-session benchmark (`--user-class agentsession`) emulates a fleet of
