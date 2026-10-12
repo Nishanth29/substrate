@@ -157,6 +157,33 @@ The liveness check on a new actor already has it running, so the first cycle of 
 runs on a freshly started actor and its resume is a no-op. Its successful `ResumeActor`,
 `ResumeActor_rtt` and `ResumeToFirstExec` samples are not recorded; failures still are.
 
+#### Sweperf Log Lines
+
+Besides the rows above, the boomer log carries per-task facts for post-processing such as
+the goodput script in tools/goodput, which decides from them whether a task was good. The
+benchmark itself judges nothing: these lines change no behavior and no gate. Times are in
+milliseconds.
+
+* `Completed sweperf cycle`: `actor`, `cycle`, `cel_ms` (0 when the execute failed),
+  `wall_ms` (resume start to suspend end), `ok` (execute and suspend succeeded), and
+  `resume_ms` (the `ResumeActor` row's figure) and `ttfe_ms` (resume start to the
+  asynchronous ack), each omitted when there is nothing to report: a no-op resume, or a
+  synchronous reply.
+* `sweperf task record`, one per finished task: `v` (1), `user` (boomer goroutine ID, unique
+  per boomer process), `actor`, `template`, `task_start` (CreateActor) and `end`,
+  `startup_ms`, `cel_ms`, `wall_ms` (as in `TaskCEL` and `TaskWallClock`), `think_ms` (think
+  time between the task's cycles), `resume_max_ms` (slowest non-no-op resume),
+  `ttfe_max_ms` (omitted when no cycle got an asynchronous ack), `retries` (failed resumes,
+  each of which retries its cycle), `failed`, and the first failure's `fail_step` (`resume`,
+  `execute` or `suspend`) and `fail_cycle`.
+* `sweperf startup failed`: `user`, `template`, `actor` and `err` for a session that did not
+  start. The older `sweperf on_start failed` line is still logged alongside it.
+* `sweperf shutdown started`: when the worker began tearing down, so later failures can be
+  told apart from the run's.
+
+Deleting the finished actor is not part of the task: a failed `DeleteActor` is retried at
+shutdown and does not change the task record.
+
 ### Agent-Session Benchmark
 
 The agent-session benchmark (`--user-class agentsession`) emulates a fleet of

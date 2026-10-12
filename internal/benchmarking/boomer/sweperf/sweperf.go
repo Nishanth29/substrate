@@ -227,6 +227,7 @@ func (r *sweperfRuntime) iterate() {
 	}
 
 	ctx := context.Background()
+	cycleBefore := user.cycleIndex
 	user.step(ctx)
 
 	if user.isDone() {
@@ -234,7 +235,13 @@ func (r *sweperfRuntime) iterate() {
 		r.retireUser(ctx, gid, user)
 	}
 
-	time.Sleep(r.dynamicWait())
+	wait := r.dynamicWait()
+	// Think time counts toward the task only between its cycles: after a cycle
+	// that completed, and not after the last one.
+	if user.cycleIndex > cycleBefore && !user.isDone() {
+		user.loopThink += wait
+	}
+	time.Sleep(wait)
 }
 
 // teardownTimeout bounds the self-teardown of an actor started after shutdown began.
@@ -286,6 +293,8 @@ func (r *sweperfRuntime) startUser(ctx context.Context) (*sweperfUser, error) {
 		userClass:    sweperfUserClass,
 		chunks:       chunks,
 		cycleIndex:   0,
+		// The same goroutine runs bindUser and every cycle of this session.
+		userID: boomerutil.GoroutineID(),
 	}
 
 	slog.Info("Creating new sweperf user session",
@@ -297,10 +306,11 @@ func (r *sweperfRuntime) startUser(ctx context.Context) (*sweperfUser, error) {
 
 	if err := r.ensureAtespaceOnce(ctx, u); err != nil {
 		bmetrics.UpdateUsers(u.userClass, -1)
-		return nil, fmt.Errorf("ensureAtespace: %w", err)
+		return nil, u.startupFailed(fmt.Errorf("ensureAtespace: %w", err))
 	}
 
 	startupStart := time.Now()
+	u.taskStart = startupStart
 	// A failed CreateActor is already recorded on its own row.
 	if err := u.create(ctx); err != nil {
 		bmetrics.UpdateUsers(u.userClass, -1)
@@ -311,7 +321,7 @@ func (r *sweperfRuntime) startUser(ctx context.Context) (*sweperfUser, error) {
 		if status.Code(err) == codes.FailedPrecondition {
 			r.atespaceReady.Store(false)
 		}
-		return nil, fmt.Errorf("createActor: %w", err)
+		return nil, u.startupFailed(fmt.Errorf("createActor: %w", err))
 	}
 
 	// poll status for liveness
@@ -320,10 +330,10 @@ func (r *sweperfRuntime) startUser(ctx context.Context) (*sweperfUser, error) {
 			time.Since(startupStart), err.Error())
 		// suspendAndDelete also decrements the user gauge.
 		u.suspendAndDelete(ctx)
-		return nil, fmt.Errorf("pollLiveness: %w", err)
+		return nil, u.startupFailed(fmt.Errorf("pollLiveness: %w", err))
 	}
-	bmetrics.RecordSuccess(derivedMetricMethod, actorStartupMetric, u.userClass,
-		time.Since(startupStart), 0)
+	u.startupDur = time.Since(startupStart)
+	bmetrics.RecordSuccess(derivedMetricMethod, actorStartupMetric, u.userClass, u.startupDur, 0)
 
 	// pollLiveness left the actor running, so cycle 1's resume is a no-op.
 	u.awake = true
@@ -382,6 +392,7 @@ func (r *sweperfRuntime) retireUser(ctx context.Context, gid int64, u *sweperfUs
 // hook, so a mid-run decrease in user count leaks actors until this runs —
 // acceptable for a run that ramps up, holds, then tears down.
 func (r *sweperfRuntime) shutdown(ctx context.Context) {
+	slog.Info("sweperf shutdown started")
 	r.stopping.Store(true)
 	r.users.Range(func(_, val any) bool {
 		val.(*sweperfUser).suspendAndDelete(ctx)
@@ -430,6 +441,17 @@ type sweperfUser struct {
 	loopCEL    time.Duration
 	loopWall   time.Duration
 	loopFailed bool
+	// Facts for the task record (logTaskRecord). userID is per session; the rest
+	// are rearmed per task with the counters above.
+	userID      int64         // boomer goroutine ID, unique per boomer process
+	taskStart   time.Time     // when startUser began creating the actor
+	startupDur  time.Duration // CreateActor until the sandbox answered /status
+	loopThink   time.Duration // think time between this task's cycles
+	loopRetries int           // failed resumes, each of which retries its cycle
+	resumeMax   time.Duration // slowest non-no-op ResumeActor, as recorded on its row
+	ttfeMax     time.Duration // slowest resume-to-ack; zero when no cycle got an async ack
+	failStep    string        // first failed step: resume, execute or suspend
+	failCycle   int           // cycle of failStep
 }
 
 // ref is the control-plane reference to this user's actor.
@@ -480,11 +502,12 @@ func (u *sweperfUser) create(ctx context.Context) error {
 	})
 }
 
-// resume wakes the actor for the next cycle and reports whether it worked. A
-// failure is the caller's cue to abandon the cycle rather than talk to a
-// sandbox that is not running.
-func (u *sweperfUser) resume(ctx context.Context) bool {
-	err := u.tracedCallRecord(ctx, "ResumeActor", !u.awake, func(callCtx context.Context, tr *metadata.MD) error {
+// resume wakes the actor for the next cycle and reports how long the RPC took,
+// as recorded on its ResumeActor row, and whether it worked. A failure is the
+// caller's cue to abandon the cycle rather than talk to a sandbox that is not
+// running.
+func (u *sweperfUser) resume(ctx context.Context) (time.Duration, bool) {
+	latency, err := u.tracedCallTimed(ctx, "ResumeActor", !u.awake, func(callCtx context.Context, tr *metadata.MD) error {
 		_, err := u.cfg.APIStub.ResumeActor(callCtx, &ateapipb.ResumeActorRequest{
 			Actor: u.ref(),
 		}, grpc.Trailer(tr))
@@ -492,9 +515,9 @@ func (u *sweperfUser) resume(ctx context.Context) bool {
 	})
 	if err != nil {
 		slog.Error("ResumeActor failed", slog.String("actor", u.actorName), slog.String("err", err.Error()))
-		return false
+		return latency, false
 	}
-	return true
+	return latency, true
 }
 
 // suspend snapshots the actor and puts it to sleep, ending a cycle. It reports
@@ -555,6 +578,13 @@ func (u *sweperfUser) tracedCall(ctx context.Context, name string, do func(conte
 // tracedCallRecord is tracedCall with optional success rows; failures are
 // always recorded.
 func (u *sweperfUser) tracedCallRecord(ctx context.Context, name string, recordSuccess bool, do func(context.Context, *metadata.MD) error) error {
+	_, err := u.tracedCallTimed(ctx, name, recordSuccess, do)
+	return err
+}
+
+// tracedCallTimed is tracedCallRecord that also returns the latency it records:
+// the server-measured elapsed time, or the client's when the trailer has none.
+func (u *sweperfUser) tracedCallTimed(ctx context.Context, name string, recordSuccess bool, do func(context.Context, *metadata.MD) error) (time.Duration, error) {
 	ctx, span := u.cfg.Tracer.Start(ctx, name)
 	defer span.End()
 
@@ -573,12 +603,12 @@ func (u *sweperfUser) tracedCallRecord(ctx context.Context, name string, recordS
 	boomerutil.LogSampledTrace(span, name, latency, source, err)
 	if err != nil {
 		bmetrics.RecordFailure("grpc", name, u.userClass, latency, err.Error())
-		return err
+		return latency, err
 	}
 	if recordSuccess {
 		bmetrics.RecordSuccess("grpc", name, u.userClass, latency, 0)
 	}
-	return nil
+	return latency, nil
 }
 
 // recordClientRTT publishes the client wall clock for an RPC whose own row carries server time.
@@ -664,19 +694,28 @@ func (u *sweperfUser) step(ctx context.Context) {
 	resumeStart := time.Now()
 	// Summed per cycle so the between-cycle think time stays out of the total.
 	defer func() { u.loopWall += time.Since(resumeStart) }()
-	if !u.resume(ctx) {
+	resumeLatency, resumed := u.resume(ctx)
+	if !resumed {
 		u.loopFailed = true
+		u.loopRetries++
+		u.noteFailure("resume", cycleNum)
 		bmetrics.RecordFailure(derivedMetricMethod, resumeToFirstExecMetric, u.userClass,
 			time.Since(resumeStart), "ResumeActor failed")
 		slog.Error("ResumeActor failed in step", slog.String("actor", u.actorName), slog.Int("cycle", cycleNum))
 		return
 	}
 	u.awake = false
+	if !noopResume {
+		u.resumeMax = max(u.resumeMax, resumeLatency)
+	}
 
 	// 2. Execute step range chunk inside sandbox
 	ackAt, execDur, err := u.execute(ctx, cycleNum, chunk.start, chunk.end)
+	cycleCEL := execDur
 	if err != nil {
 		u.loopFailed = true
+		u.noteFailure("execute", cycleNum)
+		cycleCEL = 0
 		slog.Error("execute steps failed",
 			slog.String("actor", u.actorName),
 			slog.Int("cycle", cycleNum),
@@ -685,6 +724,11 @@ func (u *sweperfUser) step(ctx context.Context) {
 	} else {
 		u.loopCEL += execDur
 	}
+	var ttfe time.Duration
+	if !noopResume && !ackAt.IsZero() {
+		ttfe = ackAt.Sub(resumeStart)
+		u.ttfeMax = max(u.ttfeMax, ttfe)
+	}
 	// A no-op resume would record a near-zero sample; failures still count.
 	if !noopResume || ackAt.IsZero() {
 		u.recordResumeToFirstExec(resumeStart, ackAt, err)
@@ -692,14 +736,27 @@ func (u *sweperfUser) step(ctx context.Context) {
 	u.recordCycleCEL(execDur, err)
 
 	// 3. Suspend actor
-	if !u.suspend(ctx) {
+	suspended := u.suspend(ctx)
+	if !suspended {
 		u.loopFailed = true
+		u.noteFailure("suspend", cycleNum)
 	}
 
-	slog.Info("Completed sweperf cycle",
+	attrs := []any{
 		slog.String("actor", u.actorName),
 		slog.Int("cycle", cycleNum),
-	)
+		slog.Float64("cel_ms", boomerutil.MsFloat(cycleCEL)),
+		slog.Float64("wall_ms", boomerutil.MsFloat(time.Since(resumeStart))),
+		slog.Bool("ok", err == nil && suspended),
+	}
+	// A no-op resume and a reply without an async ack have nothing to report.
+	if !noopResume {
+		attrs = append(attrs, slog.Float64("resume_ms", boomerutil.MsFloat(resumeLatency)))
+	}
+	if ttfe > 0 {
+		attrs = append(attrs, slog.Float64("ttfe_ms", boomerutil.MsFloat(ttfe)))
+	}
+	slog.Info("Completed sweperf cycle", attrs...)
 
 	u.cycleIndex++
 }
@@ -736,7 +793,8 @@ func (u *sweperfUser) recordCycleCEL(execDur time.Duration, err error) {
 }
 
 // recordTaskMetrics reports the finished trajectory's container compute time
-// and its wall clock, then rearms the counters for the next pass.
+// and its wall clock, logs its task record, then rearms the counters for the
+// next pass.
 func (u *sweperfUser) recordTaskMetrics() {
 	if u.loopFailed {
 		bmetrics.RecordFailure(derivedMetricMethod, taskCELMetric, u.userClass,
@@ -747,9 +805,63 @@ func (u *sweperfUser) recordTaskMetrics() {
 		bmetrics.RecordSuccess(derivedMetricMethod, taskCELMetric, u.userClass, u.loopCEL, 0)
 		bmetrics.RecordSuccess(derivedMetricMethod, taskWallClockMetric, u.userClass, u.loopWall, 0)
 	}
+	u.logTaskRecord()
 	u.loopCEL = 0
 	u.loopWall = 0
 	u.loopFailed = false
+	u.taskStart = time.Time{}
+	u.startupDur = 0
+	u.loopThink = 0
+	u.loopRetries = 0
+	u.resumeMax = 0
+	u.ttfeMax = 0
+	u.failStep = ""
+	u.failCycle = 0
+}
+
+// logTaskRecord logs one line of facts about the finished task, so a separate
+// script can decide whether it was good. Nothing here judges the task.
+func (u *sweperfUser) logTaskRecord() {
+	attrs := []any{
+		slog.Int("v", 1),
+		slog.Int64("user", u.userID),
+		slog.String("actor", u.actorName),
+		slog.String("template", u.templateName),
+		slog.Time("task_start", u.taskStart),
+		slog.Time("end", time.Now()),
+		slog.Float64("startup_ms", boomerutil.MsFloat(u.startupDur)),
+		slog.Float64("cel_ms", boomerutil.MsFloat(u.loopCEL)),
+		slog.Float64("wall_ms", boomerutil.MsFloat(u.loopWall)),
+		slog.Float64("think_ms", boomerutil.MsFloat(u.loopThink)),
+		slog.Float64("resume_max_ms", boomerutil.MsFloat(u.resumeMax)),
+		slog.Int("retries", u.loopRetries),
+		slog.Bool("failed", u.loopFailed),
+		slog.String("fail_step", u.failStep),
+		slog.Int("fail_cycle", u.failCycle),
+	}
+	if u.ttfeMax > 0 {
+		attrs = append(attrs, slog.Float64("ttfe_max_ms", boomerutil.MsFloat(u.ttfeMax)))
+	}
+	slog.Info("sweperf task record", attrs...)
+}
+
+// noteFailure keeps the task's first failed step and its cycle.
+func (u *sweperfUser) noteFailure(step string, cycle int) {
+	if u.failStep == "" {
+		u.failStep, u.failCycle = step, cycle
+	}
+}
+
+// startupFailed logs a failed session start with the user, template and actor
+// it was for, and returns err.
+func (u *sweperfUser) startupFailed(err error) error {
+	slog.Warn("sweperf startup failed",
+		slog.Int64("user", u.userID),
+		slog.String("template", u.templateName),
+		slog.String("actor", u.actorName),
+		slog.String("err", err.Error()),
+	)
+	return err
 }
 
 // executeRequest is the /execute body: the 1-based, inclusive range of trace
