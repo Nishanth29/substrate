@@ -185,6 +185,17 @@ def test_type(test: dict[str, Any]) -> str:
     return test["type"]
 
 
+def _json_object(raw: str, what: str) -> dict[str, Any]:
+    """Parses raw as a JSON object, naming `what` in the error otherwise."""
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{what} is not valid JSON: {e}") from e
+    if not isinstance(value, dict):
+        raise ValueError(f"{what} must be a JSON object")
+    return value
+
+
 def run_metadata() -> dict[str, Any]:
     """Free-form run facts handed to the runner as --metadata.
 
@@ -199,14 +210,36 @@ def run_metadata() -> dict[str, Any]:
     }
     raw = os.environ.get("BENCHMARK_METADATA")
     if raw:
-        try:
-            extra = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"BENCHMARK_METADATA is not valid JSON: {e}") from e
-        if not isinstance(extra, dict):
-            raise ValueError("BENCHMARK_METADATA must be a JSON object")
-        md.update(extra)
+        md.update(_json_object(raw, "BENCHMARK_METADATA"))
     return md
+
+
+def split_metadata_flag(test: dict[str, Any]) -> tuple[list[Any], dict[str, Any]]:
+    """Separates a test's own --metadata from the rest of its flags.
+
+    Accepts `--metadata <json>` and `--metadata=<json>`. With more than one,
+    later keys win. Raises ValueError when the value is missing or is not a
+    JSON object, rather than dropping it.
+    """
+    name = test.get("name")
+    rest: list[Any] = []
+    md: dict[str, Any] = {}
+    flags = list(test.get("flags", []))
+    i = 0
+    while i < len(flags):
+        flag = str(flags[i])
+        if flag == "--metadata":
+            if i + 1 >= len(flags):
+                raise ValueError(f"test {name!r}: --metadata needs a JSON value")
+            raw, i = str(flags[i + 1]), i + 2
+        elif flag.startswith("--metadata="):
+            raw, i = flag.split("=", 1)[1], i + 1
+        else:
+            rest.append(flags[i])
+            i += 1
+            continue
+        md.update(_json_object(raw, f"test {name!r}: --metadata"))
+    return rest, md
 
 
 def wait_for_docker(timeout: int = 120) -> None:
@@ -350,6 +383,9 @@ def validate_and_normalize_tests(tests: list[dict[str, Any]]) -> None:
                 f"(want one of {list(TEST_TYPES)})"
             )
         TYPES[ttype].validate(t)
+        if ttype == "locust":
+            # A malformed --metadata fails here rather than mid-sweep.
+            split_metadata_flag(t)
         isolate_block(t)
 
 
@@ -447,9 +483,12 @@ def run_test(
     tmpl = mod.job_tmpl(manifests_dir)
     subs.update(mod.job_subs(test))
     flags = list(test.get("flags", []))
-    # Only the locust runner knows --metadata.
+    # Only the locust runner knows --metadata. It keeps only the last one it
+    # is given, so a test's own --metadata is folded into a single merged
+    # flag; the test's keys win over the run's.
     if test_type(test) == "locust":
-        flags += ["--metadata", json.dumps(run_metadata())]
+        flags, own = split_metadata_flag(test)
+        flags += ["--metadata", json.dumps({**run_metadata(), **own})]
     manifest = render_template(tmpl, subs, flags)
     wait_for_no_active_runners()
     print(f"Submitting Job {job}", flush=True)

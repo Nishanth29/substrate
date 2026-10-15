@@ -244,11 +244,45 @@ class ClusterFactsTest(unittest.TestCase):
         self.assertIsNone(facts["worker_actor_capacity"])
         self.assertIsNone(facts["sandbox_class"])
 
-        # A malformed flag loses only these facts, not the node capacity.
+    def test_worker_facts_fail_independently(self):
+        # A bad --max-actors still yields the memory limit, sandbox class and
+        # node capacity.
+        for args in (["--max-actors=lots"], ["--max-actors", "lots"]):
+            with self.subTest(args=args):
+                facts = discover(fake_api(nodes=[node()], ns_pods=[
+                    pod(containers=[container(args=args, memory="16Gi")])]))
+                self.assertIsNone(facts["worker_actor_capacity"])
+                self.assertEqual(facts["worker_memory_limit_gb"], "16.0")
+                self.assertEqual(facts["sandbox_class"], "gvisor")
+                self.assertEqual(facts["node_count"], 1)
+
+        # A bad memory quantity still yields the capacity and sandbox class.
         facts = discover(fake_api(nodes=[node()], ns_pods=[
-            pod(containers=[container(args=["--max-actors=lots"])])]))
-        self.assertIsNone(facts["worker_actor_capacity"])
-        self.assertEqual(facts["node_count"], 1)
+            pod(containers=[container(args=["--max-actors=50"],
+                                      memory="lots")])]))
+        self.assertEqual(facts["worker_actor_capacity"], "50")
+        self.assertIsNone(facts["worker_memory_limit_gb"])
+        self.assertEqual(facts["sandbox_class"], "gvisor")
+
+        # Only the bad pod's value is skipped; a healthy pod still counts.
+        facts = discover(fake_api(nodes=[node()], ns_pods=[
+            pod(containers=[container(args=["--max-actors=lots"],
+                                      memory="lots")]),
+            pod(containers=[container(args=["--max-actors=50"],
+                                      memory="16Gi")])]))
+        self.assertEqual(facts["worker_actor_capacity"], "50")
+        self.assertEqual(facts["worker_memory_limit_gb"], "16.0")
+
+    def test_unreadable_worker_values_are_logged_once(self):
+        logs = io.StringIO()
+        bad = pod(containers=[container(args=["--max-actors=lots"],
+                                        memory="lots")])
+        with contextlib.redirect_stdout(io.StringIO()):
+            cluster_facts._worker_container_facts([bad, bad, bad], logs)
+        notices = logs.getvalue().splitlines()
+        self.assertEqual(len(notices), 1)
+        self.assertIn("--max-actors", notices[0])
+        self.assertIn("'lots'", notices[0])
 
     def test_metadata_flag(self):
         self.assertEqual(parse().metadata, {})

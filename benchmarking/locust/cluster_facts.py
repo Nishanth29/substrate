@@ -18,7 +18,8 @@
 Reads allocatable CPU/RAM, node count and worker pod count from the Kubernetes
 API, then derives the actor-density frontiers (actors per node / vCPU / GB RAM
 and the actors-per-pod percentiles) for a completed trial. Also records the
-worker pods' declared capacity, plus any caller-supplied --metadata.
+nodes' GKE version, the worker pods' declared capacity and sandbox class, the
+run window, and any caller-supplied --metadata.
 """
 
 import argparse
@@ -118,39 +119,65 @@ def _joined(values: set[Any]) -> str | None:
     return ",".join(str(v) for v in sorted(values)) or None
 
 
-def _max_actors(args: list[str]) -> int:
-    """The --max-actors value on an ateom command line, or ateom's default."""
+def _max_actors(args: list[str]) -> int | None:
+    """The --max-actors value on an ateom command line, or ateom's default.
+
+    Returns None when the flag is present but its value is not an integer.
+    """
     for i, arg in enumerate(args):
+        value = None
         if arg.startswith("--max-actors="):
-            return int(arg.split("=", 1)[1])
-        if arg == "--max-actors" and i + 1 < len(args):
-            return int(args[i + 1])
+            value = arg.split("=", 1)[1]
+        elif arg == "--max-actors" and i + 1 < len(args):
+            value = args[i + 1]
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                return None
     return ATEOM_DEFAULT_MAX_ACTORS
 
 
-def _worker_container_facts(pods: list[Any]) -> dict[str, str | None]:
+def _worker_container_facts(
+    pods: list[Any], logs: TextIO | None = None
+) -> dict[str, str | None]:
     """Reads the capacity and sandbox class each worker pod declares.
 
     A worker reports its capacity as --max-actors and its container memory
     limit. With no memory limit set the worker is bounded by its node instead,
     so the limit stays None.
+
+    Each fact is read on its own, so a malformed value skips only that value
+    and leaves the other facts intact.
     """
     capacities: set[int] = set()
     memory_gb: set[float] = set()
     sandbox_classes: set[str] = set()
+    # Logged once rather than per pod, so a large pool does not flood the log.
+    unreadable: set[str] = set()
     for p in pods:
         for c in p.spec.containers or []:
             if c.name != WORKER_CONTAINER:
                 continue
-            capacities.add(_max_actors(c.args or []))
+            capacity = _max_actors(c.args or [])
+            if capacity is None:
+                unreadable.add("--max-actors")
+            else:
+                capacities.add(capacity)
             limits = (c.resources.limits if c.resources else None) or {}
             if "memory" in limits:
-                # GiB, the same as allocatable_ram_gb.
-                memory_gb.add(
-                    round(int(parse_quantity(limits["memory"])) / (1024**3), 2))
+                try:
+                    # GiB, the same as allocatable_ram_gb.
+                    memory_gb.add(round(
+                        int(parse_quantity(limits["memory"])) / (1024**3), 2))
+                except ValueError:
+                    unreadable.add(f"memory limit {limits['memory']!r}")
             match = SANDBOX_CLASS_IMAGE.search(c.image or "")
             if match:
                 sandbox_classes.add(match.group(1))
+    if unreadable:
+        _log(logs, "Notice: skipped unreadable worker container values: "
+             + ", ".join(sorted(unreadable)))
     return {
         "worker_actor_capacity": _joined(capacities),
         "worker_memory_limit_gb": _joined(memory_gb),
@@ -159,7 +186,8 @@ def _worker_container_facts(pods: list[Any]) -> dict[str, str | None]:
 
 
 def get_cluster_hardware_facts(logs: TextIO | None = None) -> dict[str, Any]:
-    """Reads the worker pool size and the capacity of the nodes it runs on.
+    """Reads the worker pool size, the capacity and GKE version of the nodes it
+    runs on, and what each worker pod declares.
 
     Capacity is scoped to the nodes carrying worker pods, so a cluster that
     keeps its infrastructure on a separate pool does not count that pool's
@@ -183,8 +211,9 @@ def get_cluster_hardware_facts(logs: TextIO | None = None) -> dict[str, Any]:
 
     facts["worker_pod_count"] = len(pods)
 
+    # Malformed values are skipped inside; this guards an unexpected pod shape.
     try:
-        facts.update(_worker_container_facts(pods))
+        facts.update(_worker_container_facts(pods, logs))
     except Exception as e:
         _log(logs, f"Notice: could not read worker container specs: {e}")
 
@@ -221,7 +250,7 @@ def get_cluster_hardware_facts(logs: TextIO | None = None) -> dict[str, Any]:
         facts["allocatable_ram_gb"] = round(total_ram_bytes / (1024**3), 2)
         # Kept so results stay comparable across hardware changes. A mixed pool
         # is a sorted comma-joined list rather than one node picked at random.
-        facts["machine_type"] = ",".join(sorted(machine_types)) or None
+        facts["machine_type"] = _joined(machine_types)
         # The worker nodes' GKE version, e.g. v1.33.5-gke.1080000.
         facts["gke_version"] = _joined(versions)
     except Exception as e:

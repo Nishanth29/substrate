@@ -599,7 +599,8 @@ map holds the raw facts and the derived numbers side by side.
   worker pod declares, its ateom `--max-actors` (1000 when unset) and its
   container memory limit (null when unset, as the node bounds it instead).
   `sandbox_class`: `gvisor` or `microvm`, from the worker image. A mixed pool
-  gives a sorted comma-joined list for each.
+  gives a sorted comma-joined list for each. An unreadable value is skipped
+  without affecting the others, and logged once.
 * `multi_actor_worker`: `true` when `actors_per_pod_p50` is above 1.
 * `run_start`, `run_end`: Unix seconds bracketing the run, for finding its
   server-side metrics after the cluster is deleted.
@@ -607,7 +608,8 @@ map holds the raw facts and the derived numbers side by side.
   for facts only the caller knows. Non-string values are stored as JSON, and
   null values are skipped. The orchestrator passes `cluster_name`,
   `cluster_location` and `project_id` from the target cluster, plus any keys in
-  the `BENCHMARK_METADATA` environment variable (a JSON object).
+  the `BENCHMARK_METADATA` environment variable (a JSON object) and in the
+  test's own `--metadata` flag, whose keys win on conflict.
 * `actors_per_node`, `actors_per_vcpu`, `actors_per_gb_ram`: the most actors
   Locust reported running, over the matching capacity. The `-u` flag only
   stands in when no sample was read.

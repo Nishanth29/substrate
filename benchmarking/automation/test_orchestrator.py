@@ -226,14 +226,14 @@ class RunMetadataTest(unittest.TestCase):
                  self.assertRaisesRegex(ValueError, "BENCHMARK_METADATA"):
                 orchestrator.run_metadata()
 
-    def submitted_args(self, ttype):
+    def submitted_args(self, ttype, flags=("--x",)):
         """The extra args run_test hands to render_template for a test type."""
 
         class Rendered(Exception):
             pass
 
         fake = mock.Mock(job_tmpl=mock.Mock(return_value="t"), job_subs=mock.Mock(return_value={}))
-        test = {"name": "n", "type": ttype, "duration": "1m", "flags": ["--x"]}
+        test = {"name": "n", "type": ttype, "duration": "1m", "flags": list(flags)}
         with mock.patch.dict(orchestrator.TYPES, {ttype: fake}), \
              mock.patch.dict(os.environ, CLUSTER_ENV, clear=True), \
              mock.patch.object(orchestrator, "render_template", side_effect=Rendered) as render, \
@@ -248,6 +248,34 @@ class RunMetadataTest(unittest.TestCase):
 
     def test_other_types_do_not(self):
         self.assertEqual(self.submitted_args("nighthawk-ingress"), ["--x"])
+
+    def test_test_metadata_is_merged_not_overridden(self):
+        for own in (["--metadata", '{"cluster_name": "mine", "suite": "s"}'],
+                    ['--metadata={"cluster_name": "mine", "suite": "s"}']):
+            with self.subTest(own=own):
+                args = self.submitted_args("locust", ["--x", *own, "--y"])
+                # One merged --metadata, after the test's other flags.
+                self.assertEqual(args.count("--metadata"), 1)
+                self.assertFalse([a for a in args if a.startswith("--metadata=")])
+                self.assertEqual(args[:3], ["--x", "--y", "--metadata"])
+                md = json.loads(args[3])
+                # Test keys win; run keys the test does not set are kept.
+                self.assertEqual(md["cluster_name"], "mine")
+                self.assertEqual(md["suite"], "s")
+                self.assertEqual(md["project_id"], "p")
+
+    def test_bad_test_metadata_fails_clearly(self):
+        for own in (["--metadata", "not json"], ["--metadata=[1]"], ["--metadata"]):
+            with self.subTest(own=own), \
+                 self.assertRaisesRegex(ValueError, "test 'n': --metadata"):
+                orchestrator.split_metadata_flag({"name": "n", "flags": own})
+
+        # Caught by validation, before any cluster work.
+        test = {"name": "n", "type": "locust", "targetCluster": "t",
+                "file": "f", "duration": "1m", "users": 1,
+                "flags": ["--metadata", "{bad"]}
+        with self.assertRaisesRegex(ValueError, "not valid JSON"):
+            orchestrator.validate_and_normalize_tests([test])
 
     def test_metadata_survives_yaml(self):
         md = json.dumps({"cluster_name": "c: d", "q": "\"'"})
