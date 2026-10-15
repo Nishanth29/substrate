@@ -1535,9 +1535,9 @@ func TestTaskRecordForCleanTask(t *testing.T) {
 	logs := captureLogs(t)
 	cfg, _, fakeCtrl := newTestConfig(t, asyncJobHandler())
 	fakeCtrl.resumeElapsedUs = "5000"
-	cfg.Dyn = dynconfig.NewHolder(dynconfig.Config{
-		MinWait: 3 * time.Millisecond, MaxWait: 3 * time.Millisecond,
-		SweperfTotalSteps: 10, SweperfNumCycles: 2,
+	cfg.Dyn = dynconfig.Static(knobs{
+		WaitTime:   dynconfig.WaitTime{MinWait: dynconfig.Seconds(3 * time.Millisecond), MaxWait: dynconfig.Seconds(3 * time.Millisecond)},
+		TotalSteps: 10, NumCycles: 2,
 	})
 	r := newSweperfRuntime(cfg)
 	t.Cleanup(func() { r.shutdown(context.Background()) })
@@ -1567,6 +1567,7 @@ func TestTaskRecordForCleanTask(t *testing.T) {
 	rec := onlyLine(t, lines, taskRecordMsg)
 	// One think time between the two cycles; none after the last.
 	want := map[string]any{"v": 1.0, "user": float64(boomerutil.GoroutineID()), "template": defaultSweperfTemplate,
+		"cycles": 2.0, "steps": 10.0,
 		"cel_ms": 2400.0, "think_ms": 3.0, "resume_max_ms": 5.0, "retries": 0.0,
 		"failed": false, "fail_step": "", "fail_cycle": 0.0}
 	for k, v := range want {
@@ -1593,7 +1594,9 @@ func TestTaskRecordForCleanTask(t *testing.T) {
 func TestTaskRecordResumeFailureAndRetry(t *testing.T) {
 	logs := captureLogs(t)
 	cfg, _, fakeCtrl := newTestConfig(t, asyncJobHandler())
-	cfg.Dyn = dynconfig.NewHolder(dynconfig.Config{MinWait: 4 * time.Millisecond, MaxWait: 4 * time.Millisecond})
+	cfg.Dyn = dynconfig.Static(knobs{
+		WaitTime: dynconfig.WaitTime{MinWait: dynconfig.Seconds(4 * time.Millisecond), MaxWait: dynconfig.Seconds(4 * time.Millisecond)},
+	})
 	r := newSweperfRuntime(cfg)
 	u := &sweperfUser{cfg: cfg, actorName: "act", userClass: sweperfUserClass, chunks: []chunk{{0, 5}, {5, 10}}}
 	r.users.Store(boomerutil.GoroutineID(), u)
@@ -1609,7 +1612,8 @@ func TestTaskRecordResumeFailureAndRetry(t *testing.T) {
 
 	rec := onlyLine(t, lines, taskRecordMsg)
 	// The wait after the failed resume is a retry, not think time.
-	want := map[string]any{"retries": 1.0, "failed": true, "fail_step": "resume", "fail_cycle": 1.0, "think_ms": 4.0}
+	want := map[string]any{"retries": 1.0, "failed": true, "fail_step": "resume", "fail_cycle": 1.0, "think_ms": 4.0,
+		"cycles": 2.0, "steps": 10.0}
 	for k, v := range want {
 		if rec[k] != v {
 			t.Errorf("record %s = %v, want %v", k, rec[k], v)
@@ -1622,6 +1626,35 @@ func TestTaskRecordResumeFailureAndRetry(t *testing.T) {
 	}
 	if rec["wall_ms"].(float64) < sum {
 		t.Errorf("record wall_ms = %v, want at least %v including the failed resume", rec["wall_ms"], sum)
+	}
+}
+
+func TestTaskRecordCountsFollowConfigChange(t *testing.T) {
+	logs := captureLogs(t)
+	cfg, _, _ := newTestConfig(t, asyncJobHandler())
+	cfg.Dyn = dynconfig.Static(knobs{TotalSteps: 4, NumCycles: 2})
+	r := newSweperfRuntime(cfg)
+	t.Cleanup(func() { r.shutdown(context.Background()) })
+
+	r.iterate() // task 1, cycle 1
+	// A change mid-task applies from the next task on.
+	if _, _, err := cfg.Dyn.Apply([]byte(`{"sweperf_total_steps": 3, "sweperf_num_cycles": 5}`)); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	r.iterate() // task 1, cycle 2, the last
+	for range 3 {
+		r.iterate() // task 2: five cycles over three steps run as three
+	}
+
+	recs := linesWith(logs(), taskRecordMsg)
+	if len(recs) != 2 {
+		t.Fatalf("%d task records, want 2", len(recs))
+	}
+	for i, want := range []struct{ cycles, steps float64 }{{2, 4}, {3, 3}} {
+		if recs[i]["cycles"] != want.cycles || recs[i]["steps"] != want.steps {
+			t.Errorf("record %d cycles = %v, steps = %v; want %v, %v",
+				i+1, recs[i]["cycles"], recs[i]["steps"], want.cycles, want.steps)
+		}
 	}
 }
 

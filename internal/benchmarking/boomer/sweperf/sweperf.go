@@ -465,10 +465,10 @@ const shutdownConcurrency = 64
 // count leaks actors until this runs — acceptable for a run that ramps up,
 // holds, then tears down.
 func (r *sweperfRuntime) shutdown(ctx context.Context) {
+	slog.Info("sweperf shutdown started")
 	r.mu.Lock()
 	r.stopping = true
 	r.mu.Unlock()
-	slog.Info("sweperf shutdown started")
 	r.cancelRun()
 
 	waitCtx, cancelWait := context.WithTimeout(ctx, inflightWaitTimeout)
@@ -525,12 +525,12 @@ type sweperfUser struct {
 	loopFailed bool
 	// Facts for the task record (logTaskRecord).
 	userID      int64         // boomer goroutine ID, unique per boomer process
-	taskStart   time.Time     // when startUser began, before CreateAtespace
+	taskStart   time.Time     // when startUser began
 	startupDur  time.Duration // CreateActor until the sandbox answered /status
 	loopThink   time.Duration // think time between this task's cycles
 	loopRetries int           // failed resumes, each of which retries its cycle
 	resumeMax   time.Duration // slowest non-no-op ResumeActor, as recorded on its row
-	ttfeMax     time.Duration // slowest resume-to-ack; zero when no cycle got an async ack
+	ttfeMax     time.Duration // slowest resume-to-ack; zero when no cycle after the no-op resume got an async ack
 	failStep    string        // first failed step: resume, execute or suspend
 	failCycle   int           // cycle of failStep
 }
@@ -749,6 +749,15 @@ func (u *sweperfUser) isDone() bool {
 	return u.cycleIndex >= len(u.chunks)
 }
 
+// totalSteps is the number of trace steps the session's cycles cover. The
+// chunks are contiguous from step 0, so it is the last chunk's end.
+func (u *sweperfUser) totalSteps() int {
+	if len(u.chunks) == 0 {
+		return 0
+	}
+	return u.chunks[len(u.chunks)-1].end
+}
+
 // step runs one cycle: resume the actor, replay that cycle's slice of the
 // trace, then suspend it again. The final cycle skips the suspend, since the
 // actor is deleted straight after.
@@ -905,13 +914,17 @@ func (u *sweperfUser) recordTaskMetrics() {
 }
 
 // logTaskRecord logs one line of facts about the finished task, so a separate
-// script can decide whether it was good. Nothing here judges the task.
+// script can decide whether it was good. Nothing here judges the task. The
+// cycle and step counts are the ones startUser resolved for this task, so
+// records from before and after a mid-run config change stay distinguishable.
 func (u *sweperfUser) logTaskRecord() {
 	attrs := []any{
 		slog.Int("v", 1),
 		slog.Int64("user", u.userID),
 		slog.String("actor", u.actorName),
 		slog.String("template", u.templateName),
+		slog.Int("cycles", len(u.chunks)),
+		slog.Int("steps", u.totalSteps()),
 		slog.Time("task_start", u.taskStart),
 		slog.Time("end", time.Now()),
 		slog.Float64("startup_ms", boomerutil.MsFloat(u.startupDur)),

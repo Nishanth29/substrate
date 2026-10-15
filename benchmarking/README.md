@@ -249,19 +249,25 @@ nothing. Durations are in milliseconds.
 * `Completed sweperf cycle`: `actor`, `cycle`, `cel_ms` (0 when the execute failed),
   `wall_ms` (resume start to cycle end), `ok` (the execute succeeded, and so did the suspend
   if there was one), `resume_ms` (as on the `ResumeActor` row; omitted for a no-op resume)
-  and `ttfe_ms` (resume start to the asynchronous ack; omitted without one).
+  and `ttfe_ms` (resume start to the asynchronous ack; omitted without one, and for a no-op
+  resume even when its execute got one).
 * `ResumeActor failed in step`: also carries `wall_ms`. The cycle is retried on the next
   iteration, and the failed attempt's time counts toward the task's `wall_ms`.
 * `sweperf task record`, one per finished task: `v` (1), `user` (boomer goroutine ID, unique
-  per boomer process), `actor`, `template`, `task_start` (before `CreateAtespace`) and `end`,
-  `startup_ms` (`CreateActor` until the sandbox answers `/status`), `cel_ms` and `wall_ms`
-  (as in `TaskCEL` and `TaskWallClock`), `think_ms` (think time between the task's cycles),
-  `resume_max_ms` (slowest non-no-op resume), `ttfe_max_ms` (omitted when no cycle got an
-  asynchronous ack), `retries` (failed resumes), `failed`, and the first failure's
-  `fail_step` (`resume`, `execute` or `suspend`) and `fail_cycle`.
+  per boomer process), `actor`, `template`, `cycles` and `steps` (the cycle and trace step
+  counts the task ran, resolved when it started, so a mid-run change to
+  `--sweperf-num-cycles` or `--sweperf-total-steps` applies from the next task; `cycles` is
+  capped at `steps`), `task_start` (when the session started) and `end`, `startup_ms`
+  (`CreateActor` until the sandbox answers `/status`), `cel_ms` and `wall_ms` (as in `TaskCEL`
+  and `TaskWallClock`), `think_ms` (think time between the task's cycles), `resume_max_ms`
+  (slowest non-no-op resume), `ttfe_max_ms` (slowest `ttfe_ms`; omitted when no cycle after
+  the no-op resume got an asynchronous ack, so always for a one-cycle task), `retries`
+  (failed resumes), `failed`, and the first failure's `fail_step` (`resume`, `execute` or
+  `suspend`) and `fail_cycle`.
 * `sweperf on_start failed`: also carries `user`, to tie a failed start to its user.
-* `sweperf shutdown started`: the worker began tearing down. Cycles in flight are canceled,
-  so records and startup failures logged after it belong to the teardown, not the run.
+* `sweperf shutdown started`: the worker began tearing down. Startups and cycles in flight
+  are canceled: interrupted tasks log no task record, and startup failures logged after it
+  belong to the teardown, not the run.
 
 ### Agent-Session Benchmark
 
