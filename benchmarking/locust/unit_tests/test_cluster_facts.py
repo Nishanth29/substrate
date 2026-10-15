@@ -51,7 +51,7 @@ ARGV = ["runner.py", "-f", "tests/glutton.py", "-t", "1m", "-u", "10",
         "--tag", "unit", "--name", "unit-run", "--dest", "/tmp/unit"]
 
 
-GKE_VERSION = "v1.33.5-gke.1080000"
+KUBERNETES_VERSION = "v1.33.5-gke.1080000"
 
 
 def node(machine_type="c3-standard-4", name="node-a"):
@@ -61,7 +61,7 @@ def node(machine_type="c3-standard-4", name="node-a"):
         metadata=SimpleNamespace(labels=labels, name=name),
         status=SimpleNamespace(
             allocatable={"cpu": NODE_CPU, "memory": NODE_MEMORY},
-            node_info=SimpleNamespace(kubelet_version=GKE_VERSION)))
+            node_info=SimpleNamespace(kubelet_version=KUBERNETES_VERSION)))
 
 
 def container(name="ateom", args=(), memory=None,
@@ -225,7 +225,7 @@ class ClusterFactsTest(unittest.TestCase):
         self.assertEqual(facts["worker_actor_capacity"], "50")
         self.assertEqual(facts["worker_memory_limit_gb"], "16.0")  # GiB
         self.assertEqual(facts["sandbox_class"], "gvisor")
-        self.assertEqual(facts["gke_version"], GKE_VERSION)
+        self.assertEqual(facts["kubernetes_version"], KUBERNETES_VERSION)
 
         # Unset flag is ateom's default; no memory limit is unmeasured; a mixed
         # pool lists every value.

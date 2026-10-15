@@ -18,8 +18,8 @@
 Reads allocatable CPU/RAM, node count and worker pod count from the Kubernetes
 API, then derives the actor-density frontiers (actors per node / vCPU / GB RAM
 and the actors-per-pod percentiles) for a completed trial. Also records the
-nodes' GKE version, the worker pods' declared capacity and sandbox class, the
-run window, and any caller-supplied --metadata.
+nodes' Kubernetes version, the worker pods' declared capacity and sandbox
+class, the run window, and any caller-supplied --metadata.
 """
 
 import argparse
@@ -54,7 +54,7 @@ EMPTY_FACTS: dict[str, Any] = {
     "allocatable_cores": None,
     "allocatable_ram_gb": None,
     "worker_pod_count": None,
-    "gke_version": None,
+    "kubernetes_version": None,
     "worker_actor_capacity": None,
     "worker_memory_limit_gb": None,
     "sandbox_class": None,
@@ -186,8 +186,8 @@ def _worker_container_facts(
 
 
 def get_cluster_hardware_facts(logs: TextIO | None = None) -> dict[str, Any]:
-    """Reads the worker pool size, the capacity and GKE version of the nodes it
-    runs on, and what each worker pod declares.
+    """Reads the worker pool size, the capacity and Kubernetes version of the
+    nodes it runs on, and what each worker pod declares.
 
     Capacity is scoped to the nodes carrying worker pods, so a cluster that
     keeps its infrastructure on a separate pool does not count that pool's
@@ -251,8 +251,8 @@ def get_cluster_hardware_facts(logs: TextIO | None = None) -> dict[str, Any]:
         # Kept so results stay comparable across hardware changes. A mixed pool
         # is a sorted comma-joined list rather than one node picked at random.
         facts["machine_type"] = _joined(machine_types)
-        # The worker nodes' GKE version, e.g. v1.33.5-gke.1080000.
-        facts["gke_version"] = _joined(versions)
+        # The worker nodes' Kubernetes version, e.g. v1.33.5-gke.1080000.
+        facts["kubernetes_version"] = _joined(versions)
     except Exception as e:
         reason = getattr(e, "reason", e)
         _log(logs, f"Notice: could not read node capacity: {reason}")
