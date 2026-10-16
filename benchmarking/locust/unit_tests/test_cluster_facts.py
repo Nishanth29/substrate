@@ -64,8 +64,8 @@ def node(machine_type="c3-standard-4", name="node-a"):
             node_info=SimpleNamespace(kubelet_version=KUBERNETES_VERSION)))
 
 
-def container(name="ateom", args=(), memory=None,
-              image="registry/ateom-gvisor-0123abcd@sha256:00"):
+def container(name="worker", args=(), memory=None,
+              image="registry/ateworker-gvisor-0123abcd@sha256:00"):
     limits = None if memory is None else {"memory": memory}
     return SimpleNamespace(name=name, args=list(args), image=image,
                            resources=SimpleNamespace(limits=limits))
@@ -227,13 +227,13 @@ class ClusterFactsTest(unittest.TestCase):
         self.assertEqual(facts["sandbox_class"], "gvisor")
         self.assertEqual(facts["kubernetes_version"], KUBERNETES_VERSION)
 
-        # Unset flag is ateom's default; no memory limit is unmeasured; a mixed
+        # Unset flag is ateworker's default; no memory limit is unmeasured; a mixed
         # pool lists every value.
         facts = discover(fake_api(nodes=[node()], ns_pods=[
             pod(containers=[container()]),
             pod(containers=[container(
                 args=["--max-actors=1"],
-                image="registry/ateom-microvm-4567@sha256:00")]),
+                image="registry/ateworker-microvm-4567@sha256:00")]),
         ]))
         self.assertEqual(facts["worker_actor_capacity"], "1,1000")
         self.assertIsNone(facts["worker_memory_limit_gb"])

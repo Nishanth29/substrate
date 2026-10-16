@@ -39,11 +39,11 @@ LIVE_POD_PHASES = ("Running", "Pending")
 MACHINE_TYPE_LABEL = "node.kubernetes.io/instance-type"
 
 # The worker pod's container, as named by the atecontroller.
-WORKER_CONTAINER = "ateom"
-# ateom's own --max-actors default (cmd/ateom-gvisor, cmd/ateom-microvm).
-ATEOM_DEFAULT_MAX_ACTORS = 1000
-# The worker image is ateom-<sandbox class> (benchmarking/automation/README.md).
-SANDBOX_CLASS_IMAGE = re.compile(r"ateom-(gvisor|microvm)")
+WORKER_CONTAINER = "worker"
+# ateworker's own --max-actors default (cmd/ateworker-gvisor, cmd/ateworker-microvm).
+ATEWORKER_DEFAULT_MAX_ACTORS = 1000
+# The worker image is ateworker-<sandbox class> (benchmarking/automation/README.md).
+SANDBOX_CLASS_IMAGE = re.compile(r"ateworker-(gvisor|microvm)")
 
 # Shape returned when the cluster cannot be read, or when discovery is skipped
 # with --no-cluster-facts. Keeping one definition means a trial_summary row has
@@ -120,7 +120,7 @@ def _joined(values: set[Any]) -> str | None:
 
 
 def _max_actors(args: list[str]) -> int | None:
-    """The --max-actors value on an ateom command line, or ateom's default.
+    """The --max-actors value on an ateworker command line, or ateworker's default.
 
     Returns None when the flag is present but its value is not an integer.
     """
@@ -135,7 +135,7 @@ def _max_actors(args: list[str]) -> int | None:
                 return int(value)
             except ValueError:
                 return None
-    return ATEOM_DEFAULT_MAX_ACTORS
+    return ATEWORKER_DEFAULT_MAX_ACTORS
 
 
 def _worker_container_facts(

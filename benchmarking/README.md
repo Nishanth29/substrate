@@ -596,7 +596,7 @@ map holds the raw facts and the derived numbers side by side.
   a different denominator.
 * `kubernetes_version`: the worker nodes' Kubernetes version (kubelet version).
 * `worker_actor_capacity`, `worker_memory_limit_gb` (GiB): the capacity each
-  worker pod declares, its ateom `--max-actors` (1000 when unset) and its
+  worker pod declares, its ateworker `--max-actors` (1000 when unset) and its
   container memory limit (null when unset, as the node bounds it instead).
   `sandbox_class`: `gvisor` or `microvm`, from the worker image. A mixed pool
   gives a sorted comma-joined list for each. An unreadable value is skipped
