@@ -170,6 +170,9 @@ spec:
         # reserves its object's size; ones past the capacity wait their turn,
         # so the asset-staging volume below never fills up.
         - --asset-staging-capacity=8Gi
+        # BENCHMARKING ONLY (sweperf-local zstd A/B): lift the 512Mi default so
+        # snapshot uploads are not serialized by the node-wide reservation.
+        - --upload-memory-budget=64Gi
         # The plugin listens on a Unix socket, which a gRPC probe cannot
         # reach, and the image has no shell, so the binary checks itself.
         startupProbe:
