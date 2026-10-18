@@ -119,7 +119,15 @@ func TestReadZstdFrameSplitsParZstdOutput(t *testing.T) {
 func TestReadZstdFrameBoundsUnsizedSmallFrames(t *testing.T) {
 	for _, n := range []int{1, 100, 255} {
 		data := compressibleData(t, n)
-		frame, size, maxSize, ok, err := readZstdFrame(bytes.NewReader(parFrames(t, data)))
+		// parZstd now writes single-segment frames, which always declare their size,
+		// so build an unsized one directly: EncodeAll leaves the size out under 1 KiB.
+		enc, err := zstd.NewWriter(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		unsized := enc.EncodeAll(data, nil)
+		enc.Close()
+		frame, size, maxSize, ok, err := readZstdFrame(bytes.NewReader(unsized))
 		if err != nil || !ok || frame == nil {
 			t.Fatalf("n=%d: ok=%v err=%v, want a parallel-decodable frame", n, ok, err)
 		}
