@@ -19,6 +19,7 @@ import (
 	"errors"
 	"io"
 	"math/rand"
+	"os"
 	"sync"
 	"testing"
 
@@ -179,5 +180,22 @@ func TestSparsePartsWriteSizedFrames(t *testing.T) {
 	}
 	if maxSize > parZstdChunk {
 		t.Errorf("frame of %d bytes, want at most %d", maxSize, parZstdChunk)
+	}
+}
+
+func TestWriteAfterClose(t *testing.T) {
+	fz := newFramedZstd(io.Discard)
+	if err := fz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fz.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("framedZstd Write after Close = %v, want os.ErrClosed", err)
+	}
+	pz := newParZstd(io.Discard, 1)
+	if err := pz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pz.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("parZstd Write after Close = %v, want os.ErrClosed", err)
 	}
 }

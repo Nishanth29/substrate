@@ -16,6 +16,7 @@ package objectstorage
 
 import (
 	"io"
+	"os"
 	"runtime"
 	"sync"
 
@@ -169,6 +170,9 @@ func (p *parZstd) writer() {
 }
 
 func (p *parZstd) Write(b []byte) (int, error) {
+	if p.buf == nil {
+		return 0, os.ErrClosed
+	}
 	total := len(b)
 	for len(b) > 0 {
 		n := min(cap(p.buf)-len(p.buf), len(b))
@@ -274,5 +278,9 @@ func (z *framedZstd) Close() error {
 	putChunk(z.buf)
 	putFrame(z.frame)
 	z.enc, z.buf, z.frame = nil, nil, nil
-	return z.err
+	err := z.err
+	if err == nil {
+		z.err = os.ErrClosed
+	}
+	return err
 }
