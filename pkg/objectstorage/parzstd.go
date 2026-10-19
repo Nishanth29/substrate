@@ -91,9 +91,19 @@ func putFrame(b []byte) {
 	}
 }
 
-// parZstd is an io.WriteCloser that compresses what it is given as parallel zstd
-// frames, written to dst in order. Close flushes the tail and reports the first
-// error from any worker or from dst.
+// parZstd is an io.WriteCloser that compresses what it is given as independent zstd
+// frames of at most parZstdChunk input bytes, each declaring its decompressed size,
+// written to dst in order. Sized frames can be split and decoded in parallel on
+// restore. Close flushes the tail and reports the first error from any worker or
+// from dst.
+//
+// With more than one worker, chunks are compressed on a pool of goroutines. With one
+// (inline mode) there is no pool: each chunk is compressed on the caller's goroutine
+// when it fills. Inline mode holds one pooled chunk, one encoder, and a pooled frame
+// only once a full chunk is compressed, which keeps an upload part within
+// serialWorkerMemory; it suits callers that already run one encoder per parallel
+// unit of work (an upload part) and small files. Inline Write returns dst's error
+// as soon as it happens, so a failed upload stops reading its source.
 type parZstd struct {
 	dst     io.Writer
 	workers int
@@ -105,6 +115,11 @@ type parZstd struct {
 	done     chan struct{}
 	err      error
 	workerWG sync.WaitGroup
+
+	// Inline mode (workers == 1) only.
+	inline bool
+	enc    *zstd.Encoder
+	frame  []byte
 }
 
 type parZstdJob struct {
@@ -113,9 +128,20 @@ type parZstdJob struct {
 }
 
 // newParZstd starts the worker pool, capped at GOMAXPROCS (workers <= 0 asks for it).
+// One worker, after the cap, means inline mode with no goroutines, so with
+// GOMAXPROCS=1 every caller compresses inline.
 func newParZstd(dst io.Writer, workers int) *parZstd {
 	if workers <= 0 || workers > runtime.GOMAXPROCS(0) {
 		workers = runtime.GOMAXPROCS(0)
+	}
+	if workers == 1 {
+		return &parZstd{
+			dst:     dst,
+			workers: 1,
+			inline:  true,
+			enc:     newChunkEncoder(),
+			buf:     getChunk(),
+		}
 	}
 	p := &parZstd{
 		dst:     dst,
@@ -173,6 +199,9 @@ func (p *parZstd) Write(b []byte) (int, error) {
 	if p.buf == nil {
 		return 0, os.ErrClosed
 	}
+	if p.inline {
+		return p.writeInline(b)
+	}
 	total := len(b)
 	for len(b) > 0 {
 		n := min(cap(p.buf)-len(p.buf), len(b))
@@ -185,9 +214,33 @@ func (p *parZstd) Write(b []byte) (int, error) {
 	return total, nil
 }
 
-// flush dispatches the current chunk and takes a fresh buffer.
+// writeInline is Write in inline mode. It stops at the first error from dst, so the
+// caller stops feeding a failed upload. (With workers, dst's error is only known to
+// the writer goroutine and surfaces from Close.)
+func (p *parZstd) writeInline(b []byte) (int, error) {
+	total := len(b)
+	for len(b) > 0 && p.err == nil {
+		n := min(cap(p.buf)-len(p.buf), len(b))
+		p.buf = append(p.buf, b[:n]...)
+		b = b[n:]
+		if len(p.buf) == cap(p.buf) {
+			p.flush()
+		}
+	}
+	if p.err != nil {
+		return total - len(b), p.err
+	}
+	return total, nil
+}
+
+// flush dispatches the current chunk and takes a fresh buffer or, inline,
+// compresses and writes it here.
 func (p *parZstd) flush() {
 	if len(p.buf) == 0 {
+		return
+	}
+	if p.inline {
+		p.flushInline()
 		return
 	}
 	out := make(chan []byte, 1)
@@ -196,8 +249,42 @@ func (p *parZstd) flush() {
 	p.buf = <-p.free
 }
 
+// flushInline compresses the buffered chunk into one frame and writes it. Only a
+// full chunk takes the pooled frame, which is then kept for the rest of the stream;
+// a stream that is only a partial chunk (a small file) gets a frame its own size.
+// Write flushes only full chunks, so a partial one is always the tail, from Close.
+func (p *parZstd) flushInline() {
+	if p.err != nil {
+		return
+	}
+	out := p.frame
+	if out == nil {
+		if len(p.buf) == parZstdChunk {
+			p.frame = getFrame()
+			out = p.frame
+		} else {
+			out = make([]byte, 0, len(p.buf)+len(p.buf)/16)
+		}
+	}
+	out = p.enc.EncodeAll(p.buf, out[:0])
+	_, p.err = p.dst.Write(out)
+	p.buf = p.buf[:0]
+}
+
+// Close flushes the tail, returns the buffers to their pools and reports the first
+// error. Later calls to Write or Close return that error, or os.ErrClosed.
 func (p *parZstd) Close() error {
+	if p.buf == nil {
+		return p.err
+	}
 	p.flush()
+	if p.inline {
+		p.enc.Close()
+		putChunk(p.buf)
+		putFrame(p.frame)
+		p.enc, p.buf, p.frame = nil, nil, nil
+		return p.markClosed()
+	}
 	close(p.jobs)
 	close(p.ordered)
 	<-p.done
@@ -210,77 +297,17 @@ func (p *parZstd) Close() error {
 		case b := <-p.free:
 			putChunk(b)
 		default:
-			return p.err
+			return p.markClosed()
 		}
 	}
 }
 
-// framedZstd compresses on the caller's goroutine into independent frames of at most
-// parZstdChunk input bytes, each declaring its decompressed size. It is for callers
-// that already run one encoder per parallel unit of work (an upload part), so it
-// needs no workers of its own. Unlike one streaming frame per part, sized frames
-// can be split and decoded in parallel on restore. It holds one pooled chunk, one
-// pooled frame and one encoder, which keeps a part within serialWorkerMemory.
-type framedZstd struct {
-	dst   io.Writer
-	enc   *zstd.Encoder
-	buf   []byte
-	frame []byte
-	err   error
-}
-
-func newFramedZstd(dst io.Writer) *framedZstd {
-	return &framedZstd{
-		dst:   dst,
-		enc:   newChunkEncoder(),
-		buf:   getChunk(),
-		frame: getFrame(),
-	}
-}
-
-func (z *framedZstd) Write(b []byte) (int, error) {
-	total := len(b)
-	for len(b) > 0 && z.err == nil {
-		n := min(cap(z.buf)-len(z.buf), len(b))
-		z.buf = append(z.buf, b[:n]...)
-		b = b[n:]
-		if len(z.buf) == cap(z.buf) {
-			z.flush()
-		}
-	}
-	if z.err != nil {
-		return total - len(b), z.err
-	}
-	return total, nil
-}
-
-// flush compresses the buffered chunk into one frame and writes it.
-func (z *framedZstd) flush() {
-	if len(z.buf) == 0 || z.err != nil {
-		return
-	}
-	frame := z.enc.EncodeAll(z.buf, z.frame[:0])
-	_, z.err = z.dst.Write(frame)
-	// Keep the frame buffer EncodeAll returned: if it had to grow, reuse the
-	// grown one for the next chunk instead of growing again.
-	z.frame = frame
-	z.buf = z.buf[:0]
-}
-
-// Close writes the last, partial frame, returns the buffers to their pools and
-// releases the encoder. It reports the first error from dst.
-func (z *framedZstd) Close() error {
-	if z.enc == nil {
-		return z.err
-	}
-	z.flush()
-	z.enc.Close()
-	putChunk(z.buf)
-	putFrame(z.frame)
-	z.enc, z.buf, z.frame = nil, nil, nil
-	err := z.err
+// markClosed returns the first error and records os.ErrClosed if there was none, so
+// a stray Write after Close fails fast instead of spinning on the nil buffer.
+func (p *parZstd) markClosed() error {
+	err := p.err
 	if err == nil {
-		z.err = os.ErrClosed
+		p.err = os.ErrClosed
 	}
 	return err
 }

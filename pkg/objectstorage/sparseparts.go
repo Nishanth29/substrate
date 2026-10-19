@@ -128,7 +128,7 @@ func writeSparsePart(dst io.Writer, src *os.File, size int64, ranges []extentRan
 	}
 	// Sized frames rather than one streaming frame per part, so a restore can split
 	// the part and decode its frames in parallel.
-	zw := newFramedZstd(dst)
+	zw := newParZstd(dst, 1)
 	if first {
 		if err := binary.Write(zw, binary.LittleEndian, size); err != nil {
 			zw.Close()

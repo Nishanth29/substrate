@@ -20,6 +20,8 @@ import (
 	"io"
 	"math/rand"
 	"os"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -60,14 +62,27 @@ func zstdDecodeAll(t *testing.T, stream []byte) []byte {
 	return out
 }
 
-// TestFramedZstdWritesSizedFrames checks framedZstd round-trips and cuts its output
-// into frames of at most parZstdChunk that each declare their size, which is what
-// lets a restore decode them in parallel.
-func TestFramedZstdWritesSizedFrames(t *testing.T) {
+// withGOMAXPROCS runs the rest of the test with at least n Ps, so newParZstd(w, n)
+// really starts n workers instead of falling back to inline mode on a small runner.
+func withGOMAXPROCS(t *testing.T, n int) {
+	t.Helper()
+	if prev := runtime.GOMAXPROCS(0); prev < n {
+		runtime.GOMAXPROCS(n)
+		t.Cleanup(func() { runtime.GOMAXPROCS(prev) })
+	}
+}
+
+// TestParZstdInlineWritesSizedFrames checks parZstd's inline mode (one worker)
+// round-trips and cuts its output into frames of at most parZstdChunk that each
+// declare their size, which is what lets a restore decode them in parallel.
+func TestParZstdInlineWritesSizedFrames(t *testing.T) {
 	for _, n := range []int{0, 1, parZstdChunk - 1, parZstdChunk, parZstdChunk + 1, 3*parZstdChunk + 4321} {
 		data := randomBytes(int64(n), n)
 		var out bytes.Buffer
-		zw := newFramedZstd(&out)
+		zw := newParZstd(&out, 1)
+		if !zw.inline {
+			t.Fatal("newParZstd(w, 1) is not inline")
+		}
 		writeInPieces(t, zw, data)
 		if err := zw.Close(); err != nil {
 			t.Fatal(err)
@@ -88,12 +103,40 @@ func TestFramedZstdWritesSizedFrames(t *testing.T) {
 	}
 }
 
+// TestParZstdMatchesChunkedEncodeAll pins parZstd's output, in both modes, to
+// EncodeAll of each parZstdChunk of input with newChunkEncoder, concatenated: the
+// sized-frame format parallel restore relies on.
+func TestParZstdMatchesChunkedEncodeAll(t *testing.T) {
+	withGOMAXPROCS(t, 2)
+	data := randomBytes(7, 2*parZstdChunk+parZstdChunk/2+123)
+	enc := newChunkEncoder()
+	defer enc.Close()
+	var want []byte
+	for rest := data; len(rest) > 0; {
+		n := min(len(rest), parZstdChunk)
+		want = enc.EncodeAll(rest[:n], want)
+		rest = rest[n:]
+	}
+	for _, workers := range []int{1, 2} {
+		var out bytes.Buffer
+		zw := newParZstd(&out, workers)
+		writeInPieces(t, zw, data)
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(out.Bytes(), want) {
+			t.Errorf("workers=%d: output differs from chunked EncodeAll (%d vs %d bytes)", workers, out.Len(), len(want))
+		}
+	}
+}
+
 // TestPooledEncodersDoNotLeakData runs uploads back to back and side by side with
-// different data through both encoders. Pooled buffers are reused, so a
-// later upload must never carry bytes from an earlier one.
+// different data through both modes. Pooled buffers are reused, so a later upload
+// must never carry bytes from an earlier one.
 func TestPooledEncodersDoNotLeakData(t *testing.T) {
+	withGOMAXPROCS(t, 2)
 	encoders := map[string]func(io.Writer) io.WriteCloser{
-		"framed": func(w io.Writer) io.WriteCloser { return newFramedZstd(w) },
+		"inline": func(w io.Writer) io.WriteCloser { return newParZstd(w, 1) },
 		"par":    func(w io.Writer) io.WriteCloser { return newParZstd(w, 2) },
 	}
 	for name, newEnc := range encoders {
@@ -138,11 +181,11 @@ func (f *failAfter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestFramedZstdReportsWriteErrors checks a failing destination stops the encoder
-// and surfaces from Write and Close, and that Close is safe to call twice.
-func TestFramedZstdReportsWriteErrors(t *testing.T) {
+// TestParZstdInlineReportsWriteErrors checks a failing destination stops the inline
+// encoder and surfaces from Write and Close, and that Close is safe to call twice.
+func TestParZstdInlineReportsWriteErrors(t *testing.T) {
 	boom := errors.New("boom")
-	zw := newFramedZstd(&failAfter{n: 1, err: boom})
+	zw := newParZstd(&failAfter{n: 1, err: boom}, 1)
 	data := randomBytes(5, 3*parZstdChunk)
 	var werr error
 	for len(data) > 0 && werr == nil {
@@ -158,6 +201,39 @@ func TestFramedZstdReportsWriteErrors(t *testing.T) {
 	}
 	if err := zw.Close(); !errors.Is(err, boom) {
 		t.Errorf("second Close error = %v, want %v", err, boom)
+	}
+}
+
+// TestWriteSparseZstdOneWorkerDstFails checks the streamed path with one (inline)
+// worker returns the destination's error, whether it comes from Close (a tail-only
+// stream) or from Write (a full chunk, after which fail() closes the encoder). The
+// 9 MiB source is random, so its first frame is a full-size incompressible chunk.
+func TestWriteSparseZstdOneWorkerDstFails(t *testing.T) {
+	boom := errors.New("boom")
+	for _, tc := range []struct {
+		name string
+		size int
+	}{
+		{"tail_4KiB", 4 << 10},
+		{"chunk_9MiB", 9 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := make([]byte, tc.size)
+			rand.New(rand.NewSource(int64(tc.size))).Read(data)
+			path := filepath.Join(t.TempDir(), "src")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			src, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer src.Close()
+			// The first write (magic + version) succeeds; the first frame fails.
+			if _, _, err := writeSparseZstd(t.Context(), &failAfter{n: 1, err: boom}, src, 1); !errors.Is(err, boom) {
+				t.Errorf("writeSparseZstd error = %v, want %v", err, boom)
+			}
+		})
 	}
 }
 
@@ -183,19 +259,27 @@ func TestSparsePartsWriteSizedFrames(t *testing.T) {
 	}
 }
 
+// TestWriteAfterClose checks Write and a second Close fail fast with os.ErrClosed in
+// both modes, rather than spinning on (inline) or panicking over (workers) the
+// released state.
 func TestWriteAfterClose(t *testing.T) {
-	fz := newFramedZstd(io.Discard)
-	if err := fz.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fz.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
-		t.Fatalf("framedZstd Write after Close = %v, want os.ErrClosed", err)
-	}
-	pz := newParZstd(io.Discard, 1)
-	if err := pz.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := pz.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
-		t.Fatalf("parZstd Write after Close = %v, want os.ErrClosed", err)
+	withGOMAXPROCS(t, 2)
+	for _, workers := range []int{1, 2} {
+		zw := newParZstd(io.Discard, workers)
+		if got := zw.inline; got != (workers == 1) {
+			t.Fatalf("workers=%d: inline = %v", workers, got)
+		}
+		if _, err := zw.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := zw.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
+			t.Errorf("workers=%d: Write after Close = %v, want os.ErrClosed", workers, err)
+		}
+		if err := zw.Close(); !errors.Is(err, os.ErrClosed) {
+			t.Errorf("workers=%d: second Close = %v, want os.ErrClosed", workers, err)
+		}
 	}
 }

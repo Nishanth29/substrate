@@ -33,9 +33,9 @@ const (
 	// zstd state. Include the writer's frame and the producer's pending frame
 	// even when there is only one worker.
 	parallelWorkerMemory int64 = (parZstdQueue*3 + 2) * parZstdChunk
-	// A part's encoder (framedZstd) holds an input chunk, its output frame, the
-	// encoder's history for that chunk, and a copy buffer: about 26 MiB with 8 MiB
-	// chunks (BenchmarkWriteSparsePart/part=64MiB).
+	// A part's encoder (parZstd inline, workers == 1) holds an input chunk, its
+	// output frame, the encoder's history for that chunk, and a copy buffer: about
+	// 26 MiB with 8 MiB chunks (BenchmarkWriteSparsePart/part=64MiB).
 	serialWorkerMemory int64 = 32 << 20
 	sparseUploadMemory       = serialWorkerMemory + partWriterChunk
 )
