@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Builds tasks from task log events and classifies them good or bad.
+"""Builds tasks from task records and failure lines, and classifies them good or bad.
 
-A task is one pass over the trajectory. An actor may serve task after task, so
-each actor's lines are split into task segments at every "Actor finished all
-cycles" line, and a cycle's latest "Starting" is paired with its "Completed" only
-inside the current segment.
+A finished task is one task record. Each task runs on a fresh actor, so an
+actor that logged a failure before the cut-off but no record is one task that
+never finished.
 """
 
 from dataclasses import dataclass, field
@@ -27,61 +26,47 @@ import parse
 
 GOOD = "good"
 BAD = "bad"
-UNFINISHED = "unfinished"
 
 REASON_RESUME = "resume_failed"
 REASON_EXECUTE = "execute_failed"
 REASON_SUSPEND = "suspend_failed"
+REASON_FAILED = "failed"  # a failed record without a known fail_step
+REASON_SLOW_RESUME = "slow_resume"
+REASON_SLOW_TTFE = "slow_ttfe"
 REASON_SLOW = "slow"
 
-FAIL_KIND = {parse.MSG_RESUME_FAIL: REASON_RESUME, parse.MSG_EXEC_FAIL: REASON_EXECUTE,
-             parse.MSG_SUSPEND_FAIL: REASON_SUSPEND}
-
-
-@dataclass
-class Failure:
-    reason: str
-    t: float
-    cycle: Optional[int]
+STEP_REASON = {"resume": REASON_RESUME, "execute": REASON_EXECUTE, "suspend": REASON_SUSPEND}
+LINE_STEP = {parse.MSG_RESUME_FAIL: "resume", parse.MSG_EXEC_FAIL: "execute", parse.MSG_SUSPEND_FAIL: "suspend"}
 
 
 @dataclass
 class Task:
-    """One trajectory pass of one actor."""
+    """A finished task (its record) or an unfinished one (its failure lines)."""
     actor: str
-    index: int  # 0-based position among this actor's tasks
-    start: Optional[float] = None  # first "Starting" of the segment
-    end: Optional[float] = None  # "Actor finished all cycles" time, if it finished
-    cycle_ms: dict[int, float] = field(default_factory=dict)  # cycle -> latest Starting..Completed
-    starts: dict[int, int] = field(default_factory=dict)  # cycle -> number of Starting lines
-    failures: list[Failure] = field(default_factory=list)
-    _open: dict[int, float] = field(default_factory=dict, repr=False)
+    record: Optional[parse.TaskRecord] = None
+    failures: list[parse.Event] = field(default_factory=list)
+    end: Optional[float] = None  # the record's end, clamped to the cut-off
 
     @property
     def finished(self) -> bool:
-        return self.end is not None
+        return self.record is not None
 
     @property
-    def wall_ms(self) -> float:
-        """Sum of the cycles' Starting..Completed times (think time between cycles excluded)."""
-        return round(sum(self.cycle_ms.values()), 3)
+    def fail_step(self) -> str:
+        if self.record:
+            return self.record.fail_step
+        return LINE_STEP[self.failures[0].msg]
 
     @property
-    def retries(self) -> int:
-        return sum(n - 1 for n in self.starts.values())
+    def fail_cycle(self) -> Optional[int]:
+        if self.record:
+            return self.record.fail_cycle
+        return self.failures[0].cycle
 
     @property
-    def first_failure(self) -> Optional[Failure]:
-        return self.failures[0] if self.failures else None
-
-    def empty(self) -> bool:
-        return self.start is None and not self.failures
-
-
-@dataclass
-class StartupFailure:
-    t: float
-    actor: str  # from the error text; empty if it names none
+    def first_failure_t(self) -> Optional[float]:
+        """When an unfinished task first failed; records don't say when a failure happened."""
+        return self.failures[0].t if self.failures else None
 
 
 def cutoff(events: list[parse.Event], run_end: Optional[float],
@@ -102,63 +87,52 @@ def cutoff(events: list[parse.Event], run_end: Optional[float],
     return None, "none"
 
 
-def build_tasks(events: list[parse.Event], cut: Optional[float]) -> tuple[list[Task], list[StartupFailure]]:
-    """Tasks of every actor (finished and unfinished) and startup failures before the cut-off."""
+def build_tasks(run: parse.RunLog, cut: Optional[float]) -> tuple[list[Task], list[parse.Event]]:
+    """Tasks (finished and unfinished) and startup failures before the cut-off.
+
+    Every record is a task, even one logged just after the cut-off: interrupted
+    tasks log none, so its last cycle finished before the load stopped.
+    """
     limit = cut if cut is not None else float("inf")
-    tasks: list[Task] = []
-    current: dict[str, Task] = {}
-    count: dict[str, int] = {}
-    startup: list[StartupFailure] = []
-
-    def seg(actor: str) -> Task:
-        if actor not in current:
-            current[actor] = Task(actor=actor, index=count.get(actor, 0))
-            count[actor] = count.get(actor, 0) + 1
-        return current[actor]
-
-    for ev in events:
+    tasks = [Task(actor=r.actor, record=r, end=min(r.end, limit)) for r in run.records]
+    finished = {r.actor for r in run.records}
+    unfinished: dict[str, Task] = {}
+    startup = []
+    for ev in run.events:
         if ev.t > limit:
             continue
         if ev.msg.startswith(parse.MSG_ONSTART_FAIL_PREFIX):
-            startup.append(StartupFailure(t=ev.t, actor=ev.actor))
-            continue
-        if not ev.actor:
-            continue
-        if ev.msg == parse.MSG_START and ev.cycle is not None:
-            task = seg(ev.actor)
-            task.start = ev.t if task.start is None else task.start
-            task._open[ev.cycle] = ev.t  # a retried cycle replaces the earlier Starting
-            task.starts[ev.cycle] = task.starts.get(ev.cycle, 0) + 1
-        elif ev.msg == parse.MSG_DONE and ev.cycle is not None:
-            task = seg(ev.actor)
-            if ev.cycle in task._open:
-                task.cycle_ms[ev.cycle] = round(1000 * (ev.t - task._open.pop(ev.cycle)), 3)
-        elif ev.msg in FAIL_KIND:
-            seg(ev.actor).failures.append(Failure(reason=FAIL_KIND[ev.msg], t=ev.t, cycle=ev.cycle))
-        elif ev.msg.startswith(parse.MSG_FINISHED_PREFIX):
-            task = seg(ev.actor)
-            task.end = ev.t
-            tasks.append(task)
-            del current[ev.actor]
-    tasks.extend(t for t in current.values() if not t.empty())
-    tasks.sort(key=lambda t: (_first_time(t), t.actor, t.index))
+            startup.append(ev)
+        elif ev.msg in parse.FAILURE_MSGS and ev.actor and ev.actor not in finished:
+            unfinished.setdefault(ev.actor, Task(actor=ev.actor)).failures.append(ev)
+    tasks += unfinished.values()
+    tasks.sort(key=lambda t: (t.end if t.finished else t.first_failure_t, t.actor))
     return tasks, startup
 
 
-def _first_time(t: Task) -> float:
-    if t.start is not None:
-        return t.start
-    if t.failures:
-        return t.failures[0].t
-    return t.end if t.end is not None else 0.0
+def startup_episodes(startup: list[parse.Event], records: list[parse.TaskRecord]) -> list[float]:
+    """Start times of startup failure episodes: a user's consecutive startup
+    failures until its next task record. A failure without a user is its own episode."""
+    marks = sorted([(e.t, e.user, False) for e in startup] + [(r.t, r.user, True) for r in records],
+                   key=lambda m: m[0])
+    failing: set[int] = set()
+    starts = []
+    for t, user, is_record in marks:
+        if is_record:
+            failing.discard(user)
+        elif user is None or user not in failing:
+            starts.append(t)
+            if user is not None:
+                failing.add(user)
+    return starts
 
 
-def match_baseline(baselines: list[dict[str, Any]], runtime: str, machine_type: str, template: str,
-                   log_format: str) -> Optional[dict[str, Any]]:
-    """The first baseline for this runtime, machine type and task log format, and
-    template when both the baseline and the run name one."""
+def match_baseline(baselines: list[dict[str, Any]], runtime: str, machine_type: str,
+                   template: str) -> Optional[dict[str, Any]]:
+    """The first baseline for this runtime and machine type, and template when
+    both the baseline and the run name one."""
     for b in baselines:
-        if (b.get("runtime"), b.get("machine_type"), b.get("format")) != (runtime, machine_type, log_format):
+        if (b.get("runtime"), b.get("machine_type")) != (runtime, machine_type):
             continue
         if b.get("template") and template and b["template"] != template:
             continue
@@ -167,22 +141,25 @@ def match_baseline(baselines: list[dict[str, Any]], runtime: str, machine_type: 
 
 
 def classify(task: Task, mode: dict[str, Any], baseline: Optional[dict[str, Any]]) -> tuple[str, list[str]]:
-    """good / bad / unfinished, with the reasons a task is bad.
+    """good or bad, with the reasons of the first gate the task fails.
 
-    G1: any failure before the cut-off, including a resume that failed and was
-    retried, makes the task bad (the same rule as the benchmark's loopFailed).
-    G2 (TTFE / resume latency) needs a per-task record line, which the logs don't
-    have yet, so it is not applied. G3 on wall time, only with a baseline and only
-    for a task with no failure: wall_ms / wall_ref_ms above s_max is slow. An
-    unfinished task is bad only if it failed before the cut-off.
+    G1: any failure (an unfinished task has one), named by the first failure.
+    G2, when the mode enables it: the slowest resume and TTFE within their
+    bounds. G3, only with a baseline: wall_ms / wall_ref_ms within s_max.
     """
-    reasons = []
-    for f in task.failures:
-        if f.reason not in reasons:
-            reasons.append(f.reason)
     if not task.finished:
-        return (BAD, reasons) if reasons else (UNFINISHED, [])
-    if not reasons and baseline and baseline.get("wall_ref_ms"):
-        if task.wall_ms / float(baseline["wall_ref_ms"]) > float(mode["s_max"]):
-            reasons.append(REASON_SLOW)
-    return (BAD, reasons) if reasons else (GOOD, [])
+        return BAD, [STEP_REASON[task.fail_step]]
+    r = task.record
+    if r.failed:
+        return BAD, [STEP_REASON.get(r.fail_step, REASON_FAILED)]
+    if mode.get("g2"):
+        reasons = []
+        if r.resume_max_ms > 1000 * float(mode["resume_max_s"]):
+            reasons.append(REASON_SLOW_RESUME)
+        if r.ttfe_max_ms is not None and r.ttfe_max_ms > 1000 * float(mode["ttfe_max_s"]):
+            reasons.append(REASON_SLOW_TTFE)
+        if reasons:
+            return BAD, reasons
+    if baseline and baseline.get("wall_ref_ms") and r.wall_ms / float(baseline["wall_ref_ms"]) > float(mode["s_max"]):
+        return BAD, [REASON_SLOW]
+    return GOOD, []

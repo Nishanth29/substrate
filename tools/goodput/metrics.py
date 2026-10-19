@@ -36,19 +36,19 @@ def in_window(t: Optional[float], window: tuple[float, float]) -> bool:
     return t is not None and window[0] <= t <= window[1]
 
 
-def window_metrics(rows: list[dict[str, Any]], startup_ts: list[float], window: tuple[float, float],
-                   capacity: dict[str, Optional[float]], baseline: Optional[dict[str, Any]]) -> dict[str, Any]:
+def window_metrics(rows: list[dict[str, Any]], startup_ts: list[float], episode_ts: list[float],
+                   window: tuple[float, float], capacity: dict[str, Optional[float]],
+                   baseline: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Counts and rates for tasks that belong to the window.
 
     rows are classified tasks ({"status", "reasons", "end", "first_failure_t", "wall_ms"}).
-    A finished task belongs to the window it ended in; an unfinished bad task to
-    the window of its first failure; unfinished tasks without a failure are not
-    counted. Startup failures are reported as attempts only and stay out of the ratio.
+    A finished task belongs to the window it ended in, and an unfinished task
+    (always bad) to the window of its first failure. Startup failures are
+    reported as attempts and episodes and stay out of the ratio.
     """
     length = max(0.0, window[1] - window[0])
     finished = [r for r in rows if in_window(r["end"], window)]
-    unfinished_bad = [r for r in rows if r["end"] is None and r["status"] == classify.BAD
-                      and in_window(r["first_failure_t"], window)]
+    unfinished_bad = [r for r in rows if r["end"] is None and in_window(r["first_failure_t"], window)]
     good = [r for r in finished if r["status"] == classify.GOOD]
     bad = [r for r in finished if r["status"] == classify.BAD]
     reasons: dict[str, int] = {}
@@ -64,7 +64,7 @@ def window_metrics(rows: list[dict[str, Any]], startup_ts: list[float], window: 
         "tasks_done": len(finished), "tasks_good": len(good), "tasks_bad": len(bad),
         "tasks_unfinished_bad": len(unfinished_bad), "bad_reasons": dict(sorted(reasons.items())),
         "startup_failure_attempts": sum(1 for t in startup_ts if in_window(t, window)),
-        "startup_failure_episodes": None,  # needs a startup failure line that names the user
+        "startup_failure_episodes": sum(1 for t in episode_ts if in_window(t, window)),
         "good_tasks_per_hr": round(per_hr, 3) if per_hr is not None else None,
         "goodput_ratio_pct": round(100.0 * len(good) / denom, 2) if denom else None,
         "good_wall_ms_p50": percentile(walls, 50), "good_wall_ms_p90": percentile(walls, 90),

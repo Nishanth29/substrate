@@ -12,52 +12,72 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Reads one benchmark run: task log events, stats.jsonl and server_summary.json."""
+"""Reads one benchmark run: task records and events, stats.jsonl and server_summary.json."""
 
 import calendar
 import csv
 import json
-import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 # --- The task log lines (currently the sweperf benchmark's) --------------------
-# Each is a "[boomer] {json}" line with "time", "msg" and, per line, "actor",
-# "cycle" and "err".
+# Each is a "[boomer] {json}" line with "time" and "msg"; see "Sweperf Log Lines"
+# in benchmarking/README.md for the fields.
 LOG_PREFIX = "[boomer] "
-MSG_START = "Starting sweperf cycle"
-MSG_DONE = "Completed sweperf cycle"
-# Two task-end wordings: an actor that serves task after task ("... and reset
-# session back to cycle 1"), or a fresh actor per task ("... and was deleted; a
-# new actor will run the trajectory next").
-MSG_FINISHED_PREFIX = "Actor finished all cycles"
-MSG_FINISHED_REUSED = "Actor finished all cycles and reset session back to cycle 1"
-MSG_RESUME_FAIL = "ResumeActor failed in step"  # one per failed resume, with the cycle
+MSG_TASK_RECORD = "sweperf task record"  # one per finished task; interrupted tasks log none
+RECORD_VERSION = 1
+MSG_RESUME_FAIL = "ResumeActor failed in step"
 MSG_EXEC_FAIL = "execute steps failed"
 MSG_SUSPEND_FAIL = "SuspendActor failed"
-MSG_ONSTART_FAIL_PREFIX = "sweperf on_start failed"  # the actor is only in err
+MSG_ONSTART_FAIL_PREFIX = "sweperf on_start failed"
 MSG_SHUTDOWN = "sweperf shutdown started"
 MSG_BOOMER_QUIT = "Recv quit message from master, all the goroutines are stopped"
-ACTOR_IN_TEXT = re.compile(r"\b(sb-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b")
 
-KNOWN = {MSG_START, MSG_DONE, MSG_RESUME_FAIL, MSG_EXEC_FAIL, MSG_SUSPEND_FAIL, MSG_SHUTDOWN,
-         MSG_BOOMER_QUIT}
-
-# Task log wordings, from the task-end lines.
-FORMAT_REUSED_ACTOR = "reused_actor"
-FORMAT_FRESH_ACTOR = "fresh_actor"
-FORMAT_UNKNOWN = "unknown"
+FAILURE_MSGS = {MSG_RESUME_FAIL, MSG_EXEC_FAIL, MSG_SUSPEND_FAIL}
+EVENT_MSGS = FAILURE_MSGS | {MSG_SHUTDOWN, MSG_BOOMER_QUIT}
 
 
 @dataclass
 class Event:
-    """One task log line the script uses."""
+    """A task log line other than a task record: a failure, the end of the load, or a startup failure."""
     t: float  # unix seconds
     msg: str
     actor: str = ""
     cycle: Optional[int] = None
+    user: Optional[int] = None
+
+
+@dataclass
+class TaskRecord:
+    """One "sweperf task record" line. Durations in ms, times in unix seconds."""
+    t: float  # when the line was logged
+    actor: str
+    end: float
+    wall_ms: float
+    cel_ms: float
+    resume_max_ms: float
+    failed: bool
+    user: Optional[int] = None
+    template: str = ""
+    cycles: int = 0
+    steps: int = 0
+    task_start: Optional[float] = None
+    startup_ms: float = 0.0
+    think_ms: float = 0.0
+    ttfe_max_ms: Optional[float] = None
+    retries: int = 0
+    fail_step: str = ""
+    fail_cycle: Optional[int] = None  # None unless the task failed
+
+
+@dataclass
+class RunLog:
+    """What read_run takes from logs.txt."""
+    records: list[TaskRecord] = field(default_factory=list)
+    events: list[Event] = field(default_factory=list)
+    skipped_records: int = 0  # record lines of another version, or missing a required field
 
 
 def parse_time(s: str) -> float:
@@ -70,47 +90,93 @@ def parse_time(s: str) -> float:
     return secs + (float("0." + frac) if frac else 0.0)
 
 
-def is_known(msg: str) -> bool:
-    return msg in KNOWN or msg.startswith((MSG_FINISHED_PREFIX, MSG_ONSTART_FAIL_PREFIX))
-
-
-def parse_line(line: str) -> Optional[Event]:
-    """An Event for a known task log line, else None."""
+def _json_line(line: str) -> Optional[dict[str, Any]]:
+    """The JSON object of a boomer log line, else None."""
     if not line.startswith(LOG_PREFIX):
         return None
     try:
         j = json.loads(line[len(LOG_PREFIX):])
     except ValueError:
         return None
-    if not isinstance(j, dict):
+    return j if isinstance(j, dict) else None
+
+
+def _int(v: Any) -> Optional[int]:
+    """An int from a JSON number; None for anything else, bools included."""
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _float(v: Any) -> Optional[float]:
+    """A float from a JSON number; None for anything else, bools included."""
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def parse_line(line: str) -> Optional[Event]:
+    """An Event for a line in EVENT_MSGS or a startup failure, else None."""
+    j = _json_line(line)
+    if j is None:
         return None
     msg = j.get("msg")
-    if not isinstance(msg, str) or not is_known(msg) or not isinstance(j.get("time"), str):
+    if not isinstance(msg, str) or not (msg in EVENT_MSGS or msg.startswith(MSG_ONSTART_FAIL_PREFIX)):
+        return None
+    if not isinstance(j.get("time"), str):
         return None
     try:
         t = parse_time(j["time"])
     except ValueError:
         return None
-    actor = str(j.get("actor") or "")
-    if not actor and msg.startswith(MSG_ONSTART_FAIL_PREFIX):
-        m = ACTOR_IN_TEXT.search(str(j.get("err") or ""))
-        actor = m.group(1) if m else ""
-    cycle = j.get("cycle")
-    return Event(t=t, msg=msg, actor=actor, cycle=int(cycle) if isinstance(cycle, (int, float)) else None)
+    return Event(t=t, msg=msg, actor=str(j.get("actor") or ""), cycle=_int(j.get("cycle")), user=_int(j.get("user")))
 
 
-def read_events(path: Path) -> list[Event]:
-    """Known task log events in file order (each actor's lines are in order)."""
+def parse_record(line: str) -> Optional[TaskRecord]:
+    """A TaskRecord for a task record line, else None.
+
+    Raises ValueError for a task record line of another version or with a
+    missing or mistyped required field.
+    """
+    if MSG_TASK_RECORD not in line:
+        return None
+    j = _json_line(line)
+    if j is None or j.get("msg") != MSG_TASK_RECORD:
+        return None
+    if j.get("v") != RECORD_VERSION:
+        raise ValueError(f"task record version {j.get('v')!r}, want {RECORD_VERSION}")
+    try:
+        t = parse_time(j["time"])
+        end = parse_time(j["end"])
+        task_start = parse_time(j["task_start"]) if isinstance(j.get("task_start"), str) else None
+    except (KeyError, AttributeError, ValueError) as e:
+        raise ValueError(f"task record with a missing or bad time: {e}") from e
+    actor, failed = j.get("actor"), j.get("failed")
+    wall, cel, resume = _float(j.get("wall_ms")), _float(j.get("cel_ms")), _float(j.get("resume_max_ms"))
+    if not isinstance(actor, str) or not actor or not isinstance(failed, bool) or None in (wall, cel, resume):
+        raise ValueError("task record missing actor, failed, wall_ms, cel_ms or resume_max_ms")
+    return TaskRecord(
+        t=t, actor=actor, end=end, wall_ms=wall, cel_ms=cel, resume_max_ms=resume, failed=failed,
+        user=_int(j.get("user")), template=str(j.get("template") or ""), cycles=_int(j.get("cycles")) or 0,
+        steps=_int(j.get("steps")) or 0, task_start=task_start, startup_ms=_float(j.get("startup_ms")) or 0.0,
+        think_ms=_float(j.get("think_ms")) or 0.0, ttfe_max_ms=_float(j.get("ttfe_max_ms")),
+        retries=_int(j.get("retries")) or 0, fail_step=str(j.get("fail_step") or ""),
+        # Cycles are 1-based; the benchmark logs fail_cycle 0 for a task that didn't fail.
+        fail_cycle=(_int(j.get("fail_cycle")) or None) if failed else None)
+
+
+def read_run(path: Path) -> RunLog:
+    """Task records and events from one logs.txt, in file order."""
+    run = RunLog()
     with open(path, encoding="utf-8", errors="replace") as f:
-        return [ev for ev in (parse_line(line.rstrip("\n")) for line in f) if ev]
-
-
-def log_format(events: list[Event]) -> str:
-    """The task log wording the run used, from its first task-end line."""
-    for ev in events:
-        if ev.msg.startswith(MSG_FINISHED_PREFIX):
-            return FORMAT_REUSED_ACTOR if ev.msg == MSG_FINISHED_REUSED else FORMAT_FRESH_ACTOR
-    return FORMAT_UNKNOWN
+        for raw in f:
+            text = raw.rstrip("\n")
+            try:
+                rec = parse_record(text)
+            except ValueError:
+                run.skipped_records += 1
+                continue
+            if rec:
+                run.records.append(rec)
+            elif ev := parse_line(text):
+                run.events.append(ev)
+    return run
 
 
 def read_stats(path: Path) -> dict[str, dict[str, Any]]:

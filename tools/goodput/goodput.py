@@ -58,25 +58,33 @@ def runtime_of(test_name: str, trial: dict[str, Any]) -> str:
     return "microvm" if t.endswith(("_microvm", "_uvm")) else "gvisor"
 
 
-def steady_window(meta: dict[str, Any], run_dir: Path, events: list[parse.Event]) -> tuple[tuple[float, float], str]:
+def steady_window(meta: dict[str, Any], run_dir: Path, log_ts: list[float],
+                  cut: Optional[float]) -> tuple[tuple[float, float], str]:
     """server_summary's steady window, else the runner's rule on stats_history.csv,
-    else the run's start..end, else the log's first..last event."""
+    else the run's start..end, else the log's first..last line before the cut-off.
+    The window ends at the cut-off at the latest."""
     lo, hi = parse.num(meta.get("steady_start_ts")), parse.num(meta.get("steady_end_ts"))
-    if lo and hi and hi > lo:
-        return (lo, hi), "server_summary"
     start, end = parse.num(meta.get("start_ts")) or 0.0, parse.num(meta.get("end_ts")) or 0.0
-    hist = parse.steady_from_history(run_dir / "stats_history.csv", start, end)
-    if hist:
-        return hist, "stats_history"
-    if end > start > 0:
-        return (start, end), "run"
-    ts = [ev.t for ev in events]
-    return ((min(ts), max(ts)) if ts else (0.0, 0.0)), "log"
+    if lo and hi and hi > lo:
+        window, source = (lo, hi), "server_summary"
+    elif hist := parse.steady_from_history(run_dir / "stats_history.csv", start, end):
+        window, source = hist, "stats_history"
+    elif end > start > 0:
+        window, source = (start, end), "run"
+    else:
+        ts = [t for t in log_ts if cut is None or t <= cut]
+        window, source = ((min(ts), max(ts)) if ts else (0.0, 0.0)), "log"
+    if cut is not None and cut > window[0]:
+        window = (window[0], min(window[1], cut))
+    return window, source
 
 
 def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, str]] = None) -> dict[str, Any]:
     """goodput.json content for one run directory. identity (from a gs:// run path) wins over the files."""
-    events = parse.read_events(run_dir / "logs.txt")
+    log = parse.read_run(run_dir / "logs.txt")
+    if not log.records:
+        raise ValueError(f"no '{parse.MSG_TASK_RECORD}' lines in {run_dir / 'logs.txt'}; "
+                         "runs before the task record (#2537) aren't supported")
     stats = parse.read_stats(run_dir / "stats.jsonl")
     meta = parse.read_server_metadata(run_dir / "server_summary.json")
     trial_row = stats.get("trial_summary") or {}
@@ -85,26 +93,28 @@ def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, 
     test_name = ident.get("test_name") or meta.get("test_name") or trial_row.get("test_name", "")
     runtime = runtime_of(test_name, trial)
     machine_type = str(trial.get("machine_type") or "")
-    template = str(trial.get("template") or "")
-    fmt = parse.log_format(events)
+    templates = {r.template for r in log.records if r.template}
+    template = str(trial.get("template") or (templates.pop() if len(templates) == 1 else ""))
 
-    cut, cut_source = classify.cutoff(events, parse.epoch(trial.get("run_end")), parse.num(meta.get("end_ts")))
-    tasks, startup = classify.build_tasks(events, cut)
-    steady, steady_source = steady_window(meta, run_dir, events)
-    first_t = min((ev.t for ev in events), default=0.0)
-    last_t = max((ev.t for ev in events), default=0.0)
-    whole = (parse.num(meta.get("start_ts")) or first_t, cut if cut is not None else last_t)
+    cut, cut_source = classify.cutoff(log.events, parse.epoch(trial.get("run_end")), parse.num(meta.get("end_ts")))
+    tasks, startup = classify.build_tasks(log, cut)
+    startup_ts = [s.t for s in startup]
+    episode_ts = classify.startup_episodes(startup, log.records)
+    log_ts = [r.t for r in log.records] + [ev.t for ev in log.events]
+    steady, steady_source = steady_window(meta, run_dir, log_ts, cut)
+    whole = (parse.num(meta.get("start_ts")) or min(log_ts), cut if cut is not None else max(log_ts))
     capacity = {k: parse.num(trial.get(k)) for k in ("node_count", "allocatable_cores", "allocatable_ram_gb")}
-    baseline = classify.match_baseline(config.get("baselines") or [], runtime, machine_type, template, fmt)
+    baseline = classify.match_baseline(config.get("baselines") or [], runtime, machine_type, template)
 
     task_rows = []
     for t in tasks:
-        ff = t.first_failure
-        task_rows.append({"actor": t.actor, "index": t.index, "start": t.start, "end": t.end,
-                          "wall_ms": t.wall_ms, "cycles": len(t.cycle_ms), "retries": t.retries,
-                          "first_failure_t": ff.t if ff else None, "fail_step": ff.reason if ff else "",
-                          "fail_cycle": ff.cycle if ff else None, "status_by_mode": {}, "reasons_by_mode": {}})
-    startup_ts = [s.t for s in startup]
+        r = t.record
+        task_rows.append({"actor": t.actor, "user": r.user if r else None, "end": t.end,
+                          "wall_ms": r.wall_ms if r else None, "cel_ms": r.cel_ms if r else None,
+                          "resume_max_ms": r.resume_max_ms if r else None, "ttfe_max_ms": r.ttfe_max_ms if r else None,
+                          "retries": r.retries if r else None, "failed": r.failed if r else True,
+                          "first_failure_t": t.first_failure_t, "fail_step": t.fail_step, "fail_cycle": t.fail_cycle,
+                          "status_by_mode": {}, "reasons_by_mode": {}})
     modes: dict[str, Any] = {}
     for mode_name, mode in sorted((config.get("modes") or {}).items()):
         rows = []
@@ -114,11 +124,10 @@ def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, 
             row["reasons_by_mode"][mode_name] = reasons
             rows.append({**row, "status": status, "reasons": reasons})
         modes[mode_name] = {
-            "g2": "n/a",  # needs a per-task record line
+            "g2": "applied" if mode.get("g2") else "off",
             "g3_basis": "wall" if baseline and baseline.get("wall_ref_ms") else "skipped",
-            "startup_basis": "none",  # attempts can't be tied to a user yet
-            "steady": metrics.window_metrics(rows, startup_ts, steady, capacity, baseline),
-            "whole": metrics.window_metrics(rows, startup_ts, whole, capacity, baseline),
+            "steady": metrics.window_metrics(rows, startup_ts, episode_ts, steady, capacity, baseline),
+            "whole": metrics.window_metrics(rows, startup_ts, episode_ts, whole, capacity, baseline),
         }
 
     finished = sum(1 for t in tasks if t.finished)
@@ -127,14 +136,15 @@ def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, 
         "run": {"test_name": test_name, "tag": ident.get("tag") or meta.get("tag") or trial_row.get("tag", ""),
                 "run_ts": str(ident.get("run_ts") or meta.get("start_ts") or ""),
                 "run_date": ident.get("run_date", ""), "data_timestamp": meta.get("data_timestamp", ""),
-                "runtime": runtime, "machine_type": machine_type, "template": template, "log_format": fmt,
-                **capacity},
+                "runtime": runtime, "machine_type": machine_type, "template": template,
+                "record_version": parse.RECORD_VERSION, **capacity},
         "cutoff": {"ts": cut, "source": cut_source},
         "steady_window": {"start_ts": steady[0], "end_ts": steady[1], "source": steady_source},
         "baseline": baseline,
         "modes": modes,
-        "totals": {"tasks_finished": finished, "tasks_unfinished": len(tasks) - finished,
-                   "startup_failure_attempts": len(startup), "actors": len({t.actor for t in tasks})},
+        "totals": {"tasks_finished": finished, "tasks_unfinished_bad": len(tasks) - finished,
+                   "startup_failure_attempts": len(startup), "startup_failure_episodes": len(episode_ts),
+                   "skipped_records": log.skipped_records, "actors": len({t.actor for t in tasks})},
         "tasks": task_rows,
     }
 
@@ -144,9 +154,8 @@ def jsonl_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     run = result["run"]
     rows = []
     for mode_name, m in sorted(result["modes"].items()):
-        meas = {"g2": m["g2"], "g3_basis": m["g3_basis"], "startup_basis": m["startup_basis"],
-                "log_format": run["log_format"], "runtime": run["runtime"], "machine_type": run["machine_type"],
-                "template": run["template"]}
+        meas = {"g2": m["g2"], "g3_basis": m["g3_basis"], "runtime": run["runtime"],
+                "machine_type": run["machine_type"], "template": run["template"]}
         for win, prefix in (("steady", ""), ("whole", "whole_")):
             for k, v in m[win].items():
                 if k == "bad_reasons":
@@ -277,22 +286,20 @@ def cmd_baseline(a: argparse.Namespace) -> int:
     config = dict(load_config(Path(a.config)), baselines=[])
     walls: list[float] = []
     cels: list[tuple[float, float]] = []  # (TaskCEL median ms, request count)
-    seen: dict[str, set[str]] = {"runtime": set(), "machine_type": set(), "template": set(), "format": set()}
+    seen: dict[str, set[str]] = {"runtime": set(), "machine_type": set(), "template": set()}
     with tempfile.TemporaryDirectory() as tmp:
         for i, arg in enumerate(a.runs):
             run_dir, ident = resolve_run(arg, Path(tmp) / str(i))
             run = compute(run_dir, config, ident)
-            for key, field in (("runtime", "runtime"), ("machine_type", "machine_type"),
-                               ("template", "template"), ("format", "log_format")):
-                seen[key].add(run["run"][field])
-            walls += [t["wall_ms"] for t in run["tasks"] if t["end"] is not None and not t["fail_step"]]
+            for key in seen:
+                seen[key].add(run["run"][key])
+            walls += [t["wall_ms"] for t in run["tasks"] if not t["failed"]]
             cel = (parse.read_stats(run_dir / "stats.jsonl").get("actor_TaskCEL") or {}).get("measurements") or {}
             med, n = parse.num(cel.get("median_response_time")), parse.num(cel.get("request_count"))
             if med and n:
                 cels.append((med, n))
     entry: dict[str, Any] = {"runs": len(a.runs), "tasks": len(walls)}
-    for key, override in (("runtime", a.runtime), ("machine_type", a.machine_type), ("template", a.template),
-                          ("format", None)):
+    for key, override in (("runtime", a.runtime), ("machine_type", a.machine_type), ("template", a.template)):
         if override:
             entry[key] = override
         elif len(seen[key]) == 1:
@@ -325,7 +332,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     s.add_argument("runs", nargs="+", help="run directories or gs:// run paths")
     s.add_argument("--runtime", default="", help="default: the runs' runtime")
     s.add_argument("--machine-type", default="", help="default: the runs' trial_summary machine_type")
-    s.add_argument("--template", default="", help="default: the runs' trial_summary template, if any")
+    s.add_argument("--template", default="", help="default: the runs' template, if any")
     a = p.parse_args(argv)
     return {"compute": cmd_compute, "backfill": cmd_backfill, "baseline": cmd_baseline}[a.cmd](a)
 
