@@ -41,7 +41,7 @@ From the run directory the runner uploads:
 | file | used for |
 |---|---|
 | `logs.txt` | task records, failure lines, the shutdown marker, startup failures |
-| `stats.jsonl` | `trial_summary` (machine type, node count, allocatable cores and RAM) |
+| `stats.jsonl` | `trial_summary` (sandbox class, machine type, node count, allocatable cores and RAM) |
 | `server_summary.json` | `metadata`: steady window, run start/end, test name, tag |
 | `stats_history.csv` | steady window fallback, same rule as the runner |
 
@@ -132,10 +132,12 @@ the 1-user baselines (#2841). `ttfe_max_ms` currently includes the resume (#2843
 
 ## Baselines
 
-A baseline holds reference values for `baseline_ratio` checks:
+A baseline holds reference values for `baseline_ratio` checks, and the runs'
+template, runtime and machine type:
 
 ```json
-{"version": 1, "refs": {"cel_ms": 6000.0, "wall_ms": 8000.0}}
+{"version": 1, "template": "sweperf-astropy-7336", "runtime": "microvm", "machine_type": "c3-highcpu-88",
+ "refs": {"cel_ms": 6000.0, "wall_ms": 8000.0}}
 ```
 
 `goodput.py baseline` prints one from 1-user runs. It pools the tasks that
@@ -143,11 +145,21 @@ finished without failures from all the runs, and takes the median of each
 check field over the tasks that logged it. A field no task logged is left out.
 The file also records `runs`, `tasks` and `sources`, to show where it came from.
 
+- `template`, `runtime` and `machine_type` come from `trial_summary`, the test
+  name and the task records, the same way as for the scored run. `""` means
+  unknown; a file without one of the three keys is an error.
+- `baseline` refuses runs that name different values for a key. A run that
+  doesn't know a value takes the others'.
 - `compute --baseline-run <run>...` builds the baseline from the given runs
   directly. The best baseline is a 1-user run paired with the test, on the same
   cluster.
-- `compute --baseline FILE` and `backfill --baseline FILE` read a saved one. In
-  a backfill, the one baseline applies to every run.
+- `compute --baseline FILE` and `backfill --baseline FILE` read a saved one.
+
+Before using a baseline, goodput compares its `template`, `runtime` and
+`machine_type` with the run's, as exact strings, for the keys both know (a
+mixed `gvisor,microvm` run doesn't match `microvm`). On a mismatch, `compute`
+exits with an error, and `backfill` scores that run without the baseline, so its
+`baseline_ratio` checks are skipped.
 
 Without a baseline, `baseline_ratio` checks are skipped.
 
@@ -155,7 +167,10 @@ Without a baseline, `baseline_ratio` checks are skipped.
 
 `goodput.json`:
 - `version` (2), `run`, `cutoff`, `steady_window`;
-- `baseline`: `source` (`file:<path>`, `run:<paths>` or `null`) and `refs`;
+- `baseline`: `source` (`file:<path>`, `run:<paths>` or `null`), `identity` (the
+  baseline's template, runtime and machine type), `checked` (the keys compared),
+  `mismatch` (`{key: [run value, baseline value]}`) and `refs` (the values used;
+  empty on a mismatch);
 - per mode (`strict`, `relaxed`): `checks_applied` and `checks_skipped` (check
   reasons), and per window (`steady`, `whole`):
   - `tasks_done`, `tasks_good`, `tasks_bad`, `tasks_unfinished_bad`, `bad_reasons`,
@@ -174,7 +189,13 @@ Without a baseline, `baseline_ratio` checks are skipped.
 `goodput.jsonl`: one row per mode, shaped like `stats.jsonl` (`metric` =
 `goodput_strict` / `goodput_relaxed`, string `measurements`). Whole-run values
 carry a `whole_` prefix. `checks_applied` and `checks_skipped` are
-comma-separated, and `baseline_source` is empty without a baseline.
+comma-separated, `baseline_source` is empty without a baseline, and
+`baseline_mismatch` is empty unless the baseline didn't match (e.g.
+`runtime:gvisor!=microvm`).
+
+The summary line printed per run names a mode's skipped checks and why, e.g.
+`relaxed (no baseline; slow_cel, slow_wall skipped)` or
+`strict (baseline skipped: runtime:gvisor!=microvm; slow_cel, slow_wall skipped)`.
 
 ## Tests
 

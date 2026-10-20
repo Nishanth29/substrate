@@ -28,6 +28,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -445,7 +446,8 @@ class ComputeTest(unittest.TestCase):
         self.assertEqual(r["totals"], {"tasks_finished": 4, "tasks_unfinished_bad": 1, "startup_failure_attempts": 1,
                                        "startup_failure_episodes": 1, "skipped_records": 0, "actors": 5})
         strict, relaxed = r["modes"]["strict"], r["modes"]["relaxed"]
-        self.assertEqual((r["version"], r["baseline"]), (2, {"source": None, "refs": {}}))
+        self.assertEqual((r["version"], r["baseline"]),
+                         (2, {"source": None, "identity": {}, "checked": [], "mismatch": {}, "refs": {}}))
         self.assertEqual((strict["checks_applied"], strict["checks_skipped"]),
                          (["slow_resume", "slow_ttfe"], ["slow_cel", "slow_wall"]))
         self.assertEqual((relaxed["checks_applied"], relaxed["checks_skipped"]), ([], ["slow_cel", "slow_wall"]))
@@ -474,12 +476,13 @@ class ComputeTest(unittest.TestCase):
                 goodput.compute(write_run(Path(tmp), [REAL["start"], REAL["quit"]], {}), CONFIG)
 
     def test_compute_with_a_baseline(self):
-        baseline = {"source": "file:base.json", "refs": {"wall_ms": 4000.0, "cel_ms": 6000.0}}
+        baseline = {"source": "file:base.json", "refs": {"wall_ms": 4000.0, "cel_ms": 6000.0},
+                    "identity": {"template": "", "runtime": "", "machine_type": ""}}
         with tempfile.TemporaryDirectory() as tmp:
             r = goodput.compute(write_run(Path(tmp), [record(11), line(20, parse.MSG_BOOMER_QUIT)],
                                           {"start_ts": T0, "end_ts": T0 + 30}), CONFIG, baseline=baseline)
         strict, relaxed = r["modes"]["strict"], r["modes"]["relaxed"]
-        self.assertEqual(r["baseline"], baseline)
+        self.assertEqual(r["baseline"], {**baseline, "checked": [], "mismatch": {}})
         self.assertEqual(strict["checks_skipped"], [])
         self.assertEqual(strict["whole"]["bad_reasons"], {"slow_wall": 1})  # wall 8000 / 4000 > 1.5; cel 1.0
         self.assertEqual((strict["whole"]["wall_ms_ratio_p50"], strict["whole"]["cel_ms_ratio_p50"]), (2.0, 1.0))
@@ -570,7 +573,7 @@ class BaselineTest(unittest.TestCase):
 
     def test_a_field_no_task_logged_is_left_out(self):
         with tempfile.TemporaryDirectory() as tmp:
-            refs, n = goodput.baseline_refs([write_run(Path(tmp), [record(11, think_ms=None)], {})])
+            refs, n, _ = goodput.baseline_refs([(write_run(Path(tmp), [record(11, think_ms=None)], {}), {})])
         self.assertEqual(n, 1)
         self.assertNotIn("think_ms", refs)
 
@@ -579,7 +582,7 @@ class BaselineTest(unittest.TestCase):
                 line(25, parse.MSG_RESUME_FAIL, C, cycle=1)]
         with tempfile.TemporaryDirectory() as tmp:
             run = write_run(Path(tmp), logs, {})
-            refs, n = goodput.baseline_refs([run])
+            refs, n, _ = goodput.baseline_refs([(run, {})])
             totals = goodput.compute(run, CONFIG)["totals"]
         self.assertEqual((n, totals["tasks_finished"], totals["tasks_unfinished_bad"]), (2, 2, 0))
         self.assertEqual(refs["wall_ms"], 8500.0)
@@ -594,16 +597,148 @@ class BaselineTest(unittest.TestCase):
             self.assertTrue(err.startswith("baseline: ") and err.count("\n") == 1, err)
 
     def test_load_baseline(self):
+        ident = {"template": "t", "runtime": "microvm", "machine_type": ""}
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "base.json"
-            path.write_text(json.dumps({"version": 1, "refs": {"cel_ms": 5000, "wall_ms": 9000.5}}), encoding="utf-8")
+            path.write_text(json.dumps({"version": 1, "refs": {"cel_ms": 5000, "wall_ms": 9000.5}, **ident}),
+                            encoding="utf-8")
             self.assertEqual(goodput.load_baseline(path),
-                             {"source": f"file:{path}", "refs": {"cel_ms": 5000, "wall_ms": 9000.5}})
-            for bad in ({"version": 2, "refs": {}}, {"version": 1}, {"version": 1, "refs": {"fail_cycle": 1}},
-                        {"version": 1, "refs": {"cel_ms": True}}, {"version": 1, "refs": {"cel_ms": "5"}}, []):
+                             {"source": f"file:{path}", "refs": {"cel_ms": 5000, "wall_ms": 9000.5}, "identity": ident})
+            for bad in ({"version": 2, "refs": {}, **ident}, {"version": 1, **ident},
+                        {"version": 1, "refs": {"fail_cycle": 1}, **ident},
+                        {"version": 1, "refs": {"cel_ms": True}, **ident},
+                        {"version": 1, "refs": {"cel_ms": "5"}, **ident},
+                        {"version": 1, "refs": {}, "template": "t", "runtime": "microvm"},
+                        {"version": 1, "refs": {}, **ident, "machine_type": None}, []):
                 path.write_text(json.dumps(bad), encoding="utf-8")
                 with self.assertRaises(ValueError, msg=bad):
                     goodput.load_baseline(path)
+
+
+GVISOR = {"machine_type": "c3-highcpu-88", "sandbox_class": "gvisor"}
+MICROVM = {"machine_type": "c3-highcpu-88", "sandbox_class": "microvm"}
+RUN_LAYOUT = "runs/{test}/run_date=2026-10-19/run_ts=1/run_tag=t"
+
+
+class IdentityTest(unittest.TestCase):
+    """The baseline records its runs' template, runtime and machine type, and is
+    only used for a run that matches."""
+
+    def baseline_file(self, d: Path, trial: dict) -> Path:
+        one_user = write_run(d / "one_user", [record(11, wall_ms=4000.0)], {}, trial)
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            self.assertEqual(goodput.main(["baseline", str(one_user)]), 0)
+        (d / "base.json").write_text(printed.getvalue(), encoding="utf-8")
+        return d / "base.json"
+
+    def test_baseline_records_identity_and_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.baseline_file(Path(tmp), MICROVM)
+            j = json.loads(path.read_text())
+            loaded = goodput.load_baseline(path)
+        want = {"template": "sweperf-astropy-7336", "runtime": "microvm", "machine_type": "c3-highcpu-88"}
+        self.assertEqual({k: j[k] for k in goodput.IDENTITY_KEYS}, want)
+        self.assertEqual(loaded["identity"], want)
+
+    def test_pooling_refuses_runs_that_differ(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            g = write_run(Path(tmp) / "g", [record(11)], {}, GVISOR)
+            m = write_run(Path(tmp) / "m", [record(11)], {}, {**MICROVM, "machine_type": "c3-highcpu-192-metal"})
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = goodput.main(["baseline", str(g), str(m)])
+            out, err = out.getvalue(), err.getvalue()
+        self.assertEqual((rc, out), (1, ""))
+        self.assertEqual(err, "baseline: the baseline runs differ in runtime gvisor, microvm; "
+                              "machine_type c3-highcpu-192-metal, c3-highcpu-88\n")
+
+    def test_pooling_fills_unknown_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            known = write_run(Path(tmp) / "a", [record(11)], {}, MICROVM)
+            unknown = write_run(Path(tmp) / "b", [record(11)], {}, {"sandbox_class": "microvm"})
+            _, _, identity = goodput.baseline_refs([(known, {}), (unknown, {})])
+        self.assertEqual(identity["machine_type"], "c3-highcpu-88")
+        empty = {k: "" for k in goodput.IDENTITY_KEYS}
+        self.assertEqual(goodput.pool_identity([empty, empty]), empty)
+
+    def test_local_dir_and_gs_path_resolve_the_same_identity(self):
+        # No sandbox_class, so the runtime comes from the test name in the path.
+        test = "sweperf_astropy_1_user_uvm"
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp) / RUN_LAYOUT.format(test=test), [record(11)], {}, {"machine_type": "m"})
+            local = goodput.baseline_from_runs([str(run)], Path(tmp))
+            _, _, from_gs = goodput.baseline_refs([(run, goodput.identity_from_path(
+                "gs://bucket/" + RUN_LAYOUT.format(test=test)))])
+        self.assertEqual(local["identity"], from_gs)
+        self.assertEqual(from_gs["runtime"], "microvm")
+
+    def test_compute_exits_on_a_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            base = self.baseline_file(d, MICROVM)
+            run = write_run(d / "run", [record(11)], {}, GVISOR)
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                rc = goodput.main(["compute", str(run), "--baseline", str(base), "--out", str(d / "out")])
+            wrote = (d / "out").exists()
+        self.assertEqual((rc, wrote), (1, False))
+        self.assertTrue(err.getvalue().startswith("baseline: doesn't match the run (runtime:gvisor!=microvm)"))
+        self.assertEqual(err.getvalue().count("\n"), 1)
+
+    def test_backfill_keeps_a_mismatched_run_without_its_ratio_checks(self):
+        gs_dir = "gs://bucket/" + RUN_LAYOUT.format(test="sweperf_150u_gvisor")
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            baseline = goodput.load_baseline(self.baseline_file(d, MICROVM))
+            run = write_run(d / "run", [record(11)], {}, GVISOR)
+            with mock.patch.object(goodput, "fetch_run", lambda gs, dest: run):
+                row = goodput.backfill_one(gs_dir, CONFIG, d / "out", baseline)
+            out = d / "out" / "sweperf_150u_gvisor" / "run_date=2026-10-19" / "run_ts=1" / "run_tag=t"
+            result = json.loads((out / "goodput.json").read_text())
+            jsonl = [json.loads(x) for x in (out / "goodput.jsonl").read_text().splitlines()]
+        self.assertEqual((row["ok"], row["baseline_mismatch"]), (True, "runtime:gvisor!=microvm"))
+        self.assertIn("strict (baseline skipped: runtime:gvisor!=microvm; slow_cel, slow_wall skipped): good",
+                      row["line"])
+        self.assertEqual(result["baseline"]["mismatch"], {"runtime": ["gvisor", "microvm"]})
+        self.assertEqual(result["baseline"]["refs"], {})
+        self.assertEqual(result["modes"]["strict"]["checks_skipped"], ["slow_cel", "slow_wall"])
+        self.assertEqual({r["measurements"]["baseline_mismatch"] for r in jsonl}, {"runtime:gvisor!=microvm"})
+
+    def test_values_one_side_lacks_are_not_compared(self):
+        baseline = {"source": "test", "refs": {"wall_ms": 4000.0},
+                    "identity": {"template": "sweperf-astropy-7336", "runtime": "gvisor", "machine_type": "c3"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            r = goodput.compute(write_run(Path(tmp), [record(11)], {}, {"sandbox_class": "gvisor"}), CONFIG,
+                                baseline=baseline)
+        self.assertEqual((r["baseline"]["checked"], r["baseline"]["mismatch"]), (["template", "runtime"], {}))
+        self.assertEqual(r["baseline"]["refs"], {"wall_ms": 4000.0})
+        self.assertEqual(goodput.jsonl_rows(r)[0]["measurements"]["baseline_mismatch"], "")
+
+    def test_a_mixed_runtime_does_not_match_a_single_one(self):
+        baseline = {"source": "test", "refs": {"wall_ms": 4000.0},
+                    "identity": {"template": "", "runtime": "microvm", "machine_type": ""}}
+        with tempfile.TemporaryDirectory() as tmp:
+            r = goodput.compute(write_run(Path(tmp), [record(11)], {}, {"sandbox_class": "gvisor,microvm"}), CONFIG,
+                                baseline=baseline)
+        self.assertEqual(r["baseline"]["mismatch"], {"runtime": ["gvisor,microvm", "microvm"]})
+
+    def test_summary_line_names_skipped_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            run = write_run(d / "run", [record(11)], {}, MICROVM)
+            plain = goodput.summary_line(goodput.compute(run, CONFIG))
+            matched = goodput.summary_line(goodput.compute(run, CONFIG, baseline=goodput.load_baseline(
+                self.baseline_file(d, MICROVM))))
+            partial = goodput.summary_line(goodput.compute(run, CONFIG, baseline={
+                "source": "test", "refs": {"wall_ms": 4000.0}, "identity": {}}))
+            no_refs = goodput.summary_line(goodput.compute(run, CONFIG, baseline={
+                "source": "test", "refs": {}, "identity": {}}))
+        self.assertIn("relaxed (no baseline; slow_cel, slow_wall skipped): good", plain)
+        self.assertIn("strict (no baseline; slow_cel, slow_wall skipped): good", plain)
+        self.assertIn("| relaxed: good", matched)
+        self.assertIn("| strict: good", matched)
+        self.assertIn("strict (no baseline value; slow_cel skipped): good", partial)
+        self.assertIn("strict (no baseline value; slow_cel, slow_wall skipped): good", no_refs)
 
 
 if __name__ == "__main__":

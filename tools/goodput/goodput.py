@@ -43,6 +43,8 @@ import parse  # noqa: E402
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "config.json"
 BASELINE_VERSION = 1
+# What a baseline records about its runs, and is compared on (see compare_identity).
+IDENTITY_KEYS = ("template", "runtime", "machine_type")
 RUN_FILES = ("logs.txt", "stats.jsonl", "server_summary.json", "stats_history.csv")
 RUN_PATH = re.compile(r"/runs/(?P<test>[^/]+)/run_date=(?P<date>[^/]+)/run_ts=(?P<ts>\d+)/run_tag=(?P<tag>[^/]+)/?$")
 
@@ -115,22 +117,51 @@ def load_run(run_dir: Path) -> Run:
     return Run(log, meta, trial_row, trial, cut, cut_source, tasks, startup)
 
 
-def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, str]] = None,
-            baseline: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """goodput.json content for one run directory. identity (from a gs:// run path) wins over the files.
+def run_identity(run: Run, ident: Optional[dict[str, str]] = None) -> dict[str, str]:
+    """The run's test_name, runtime, machine_type and template; "" when unknown
+    (runtime always has one, see runtime_of).
 
-    baseline is {"source": ..., "refs": {field: value}} from --baseline or
-    --baseline-run; without one, baseline_ratio checks are skipped.
+    ident (from the run's .../runs/<test>/run_date=... path, see identity_from_path)
+    wins over the files for test_name. The template is trial_summary's, else the
+    one template the records name.
+    """
+    ident = ident or {}
+    test_name = ident.get("test_name") or run.meta.get("test_name") or run.trial_row.get("test_name", "")
+    templates = {r.template for r in run.log.records if r.template}
+    return {"test_name": test_name, "runtime": runtime_of(test_name, run.trial),
+            "machine_type": str(run.trial.get("machine_type") or ""),
+            "template": str(run.trial.get("template") or (templates.pop() if len(templates) == 1 else ""))}
+
+
+def compare_identity(run_id: dict[str, str], base_id: dict[str, str]) -> tuple[list[str], dict[str, list[str]]]:
+    """The identity keys both sides know (checked), and those whose values differ
+    as {key: [run value, baseline value]}. Values are compared as exact strings, so
+    a mixed "gvisor,microvm" run doesn't match a "microvm" baseline."""
+    checked = [k for k in IDENTITY_KEYS if run_id.get(k) and base_id.get(k)]
+    return checked, {k: [run_id[k], base_id[k]] for k in checked if run_id[k] != base_id[k]}
+
+
+def mismatch_text(mismatch: dict[str, list[str]]) -> str:
+    """e.g. "runtime:gvisor!=microvm, machine_type:a!=b" (run value first); "" when they match."""
+    return ", ".join(f"{k}:{run}!={base}" for k, (run, base) in mismatch.items())
+
+
+def compute(run_dir: Path, config: dict[str, Any], ident: Optional[dict[str, str]] = None,
+            baseline: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """goodput.json content for one run directory. ident (from the run's path, see
+    identity_from_path) wins over the files.
+
+    baseline is {"source", "refs", "identity"} from --baseline or --baseline-run;
+    without one, baseline_ratio checks are skipped. When the baseline's identity
+    differs from the run's (see compare_identity), its refs aren't used either, and
+    the mismatch is recorded under "baseline" for the caller to act on.
     """
     run = load_run(run_dir)
     log, meta, trial_row, trial, cut, tasks, startup = (run.log, run.meta, run.trial_row, run.trial, run.cut,
                                                         run.tasks, run.startup)
-    ident = identity or {}
-    test_name = ident.get("test_name") or meta.get("test_name") or trial_row.get("test_name", "")
-    runtime = runtime_of(test_name, trial)
-    machine_type = str(trial.get("machine_type") or "")
-    templates = {r.template for r in log.records if r.template}
-    template = str(trial.get("template") or (templates.pop() if len(templates) == 1 else ""))
+    ident = ident or {}
+    rid = run_identity(run, ident)
+    test_name, runtime, machine_type, template = rid["test_name"], rid["runtime"], rid["machine_type"], rid["template"]
 
     startup_ts = [s.t for s in startup]
     episode_ts = classify.startup_episodes(startup, log.records)
@@ -138,7 +169,10 @@ def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, 
     steady, steady_source = steady_window(meta, run_dir, log_ts, cut)
     whole = (parse.num(meta.get("start_ts")) or min(log_ts), cut if cut is not None else max(log_ts))
     capacity = {k: parse.num(trial.get(k)) for k in ("node_count", "allocatable_cores", "allocatable_ram_gb")}
-    refs = dict((baseline or {}).get("refs") or {})
+    base = baseline or {}
+    base_identity = dict(base.get("identity") or {})
+    checked, mismatch = compare_identity(rid, base_identity)
+    refs = {} if mismatch else dict(base.get("refs") or {})
 
     task_rows = []
     for t in tasks:
@@ -177,7 +211,8 @@ def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, 
                 "record_version": parse.RECORD_VERSION, **capacity},
         "cutoff": {"ts": cut, "source": run.cut_source},
         "steady_window": {"start_ts": steady[0], "end_ts": steady[1], "source": steady_source},
-        "baseline": {"source": (baseline or {}).get("source"), "refs": refs},
+        "baseline": {"source": base.get("source"), "identity": base_identity, "checked": checked,
+                     "mismatch": mismatch, "refs": refs},
         "modes": modes,
         "totals": {"tasks_finished": finished, "tasks_unfinished_bad": len(tasks) - finished,
                    "startup_failure_attempts": len(startup), "startup_failure_episodes": len(episode_ts),
@@ -188,15 +223,33 @@ def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, 
 
 # --- Baselines ------------------------------------------------------------------
 
-def baseline_refs(run_dirs: list[Path]) -> tuple[dict[str, float], int]:
-    """Reference values from 1-user runs, and how many tasks they come from.
+def pool_identity(identities: list[dict[str, str]]) -> dict[str, str]:
+    """The identity shared by the baseline runs: per key, the one non-empty value,
+    or "" when every run is empty. Raises when two runs name different values."""
+    pooled, differ = {}, []
+    for k in IDENTITY_KEYS:
+        values = {i[k] for i in identities if i[k]}
+        if len(values) > 1:
+            differ.append(f"{k} {', '.join(sorted(values))}")
+        pooled[k] = values.pop() if len(values) == 1 else ""
+    if differ:
+        raise ValueError(f"the baseline runs differ in {'; '.join(differ)}")
+    return pooled
 
-    Pools the finished, non-failed tasks of all the runs (built like compute
-    builds them, up to the cut-off) and takes, for each check field, the median
-    over the tasks that logged it. A field no task logged is left out. Applies
-    no checks. Raises when the runs have no clean task.
+
+def baseline_refs(runs: list[tuple[Path, dict[str, str]]]) -> tuple[dict[str, float], int, dict[str, str]]:
+    """Reference values from 1-user runs, how many tasks they come from, and the
+    runs' identity (see pool_identity).
+
+    runs are (run directory, ident) pairs, ident as resolve_run returns it. Pools
+    the finished, non-failed tasks of all the runs (built like compute builds
+    them, up to the cut-off) and takes, for each check field, the median over the
+    tasks that logged it. A field no task logged is left out. Applies no checks.
+    Raises when the runs differ in identity or have no clean task.
     """
-    clean = [t.record for d in run_dirs for t in load_run(d).tasks if t.finished and not t.record.failed]
+    loaded = [(load_run(d), ident) for d, ident in runs]
+    identity = pool_identity([run_identity(run, ident) for run, ident in loaded])
+    clean = [t.record for run, _ in loaded for t in run.tasks if t.finished and not t.record.failed]
     if not clean:
         raise ValueError("no finished task without failures in the baseline runs")
     refs = {}
@@ -204,11 +257,11 @@ def baseline_refs(run_dirs: list[Path]) -> tuple[dict[str, float], int]:
         values = [getattr(r, f) for r in clean if getattr(r, f) is not None]
         if values:
             refs[f] = round(float(statistics.median(values)), 3)
-    return refs, len(clean)
+    return refs, len(clean), identity
 
 
 def load_baseline(path: Path) -> dict[str, Any]:
-    """A saved baseline (from the baseline command) as {"source", "refs"}."""
+    """A saved baseline (from the baseline command) as {"source", "refs", "identity"}."""
     with open(path, encoding="utf-8") as f:
         j = json.load(f)
     refs = j.get("refs") if isinstance(j, dict) else None
@@ -217,14 +270,16 @@ def load_baseline(path: Path) -> dict[str, Any]:
     for k, v in refs.items():
         if k not in classify.CHECK_FIELDS or not parse.is_number(v):
             raise ValueError(f"{path}: refs.{k} must be a check field with a number")
-    return {"source": f"file:{path}", "refs": refs}
+    for k in IDENTITY_KEYS:
+        if not isinstance(j.get(k), str):
+            raise ValueError(f"{path}: needs '{k}' (\"\" when unknown); write it with the baseline command")
+    return {"source": f"file:{path}", "refs": refs, "identity": {k: j[k] for k in IDENTITY_KEYS}}
 
 
 def baseline_from_runs(args: list[str], tmp: Path) -> dict[str, Any]:
-    """{"source", "refs"} from paired 1-user runs (directories or gs:// paths)."""
-    dirs = [resolve_run(arg, tmp / f"baseline{i}")[0] for i, arg in enumerate(args)]
-    refs, _ = baseline_refs(dirs)
-    return {"source": "run:" + ",".join(args), "refs": refs}
+    """{"source", "refs", "identity"} from paired 1-user runs (directories or gs:// paths)."""
+    refs, _, identity = baseline_refs([resolve_run(arg, tmp / f"baseline{i}") for i, arg in enumerate(args)])
+    return {"source": "run:" + ",".join(args), "refs": refs, "identity": identity}
 
 
 def jsonl_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
@@ -233,7 +288,8 @@ def jsonl_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     for mode_name, m in sorted(result["modes"].items()):
         meas = {"checks_applied": ",".join(m["checks_applied"]), "checks_skipped": ",".join(m["checks_skipped"]),
-                "baseline_source": result["baseline"]["source"] or "", "runtime": run["runtime"],
+                "baseline_source": result["baseline"]["source"] or "",
+                "baseline_mismatch": mismatch_text(result["baseline"]["mismatch"]), "runtime": run["runtime"],
                 "machine_type": run["machine_type"], "template": run["template"]}
         for win, prefix in (("steady", ""), ("whole", "whole_")):
             for k, v in m[win].items():
@@ -256,11 +312,18 @@ def write_outputs(result: dict[str, Any], out: Path) -> None:
 
 
 def summary_line(result: dict[str, Any]) -> str:
-    run = result["run"]
+    """One line per run. A mode with skipped checks says which and why, so a ratio
+    without the baseline checks doesn't read like a full result."""
+    run, base = result["run"], result["baseline"]
+    if base["mismatch"]:
+        why = f"baseline skipped: {mismatch_text(base['mismatch'])}"
+    else:
+        why = "no baseline" if base["source"] is None else "no baseline value"
     parts = [f"{run['test_name'] or '?'} {run['run_date']} {run['runtime']} {run['machine_type']}"]
     for mode_name, m in sorted(result["modes"].items()):
         s = m["steady"]
-        parts.append(f"{mode_name}: good {s['tasks_good']}/{s['tasks_done']} done (+{s['tasks_unfinished_bad']} "
+        label = f"{mode_name} ({why}; {', '.join(m['checks_skipped'])} skipped)" if m["checks_skipped"] else mode_name
+        parts.append(f"{label}: good {s['tasks_good']}/{s['tasks_done']} done (+{s['tasks_unfinished_bad']} "
                      f"unfinished bad), {s['good_tasks_per_hr']} good/h, ratio {s['goodput_ratio_pct']}%")
     return " | ".join(parts)
 
@@ -326,6 +389,10 @@ def cmd_compute(a: argparse.Namespace) -> int:
             return 1
         run_dir, ident = resolve_run(a.run, Path(tmp))
         result = compute(run_dir, config, ident, baseline)
+        if result["baseline"]["mismatch"]:
+            print(f"baseline: doesn't match the run ({mismatch_text(result['baseline']['mismatch'])}); "
+                  "use a baseline from the same template, runtime and machine type", file=sys.stderr)
+            return 1
         out = Path(a.out) if a.out else (Path("goodput-out") if a.run.startswith("gs://") else run_dir)
         write_outputs(result, out)
     print(summary_line(result))
@@ -335,7 +402,11 @@ def cmd_compute(a: argparse.Namespace) -> int:
 
 def backfill_one(gs_dir: str, config: dict[str, Any], out_root: Path,
                  baseline: Optional[dict[str, Any]]) -> dict[str, Any]:
-    """Computes one run under out_root (mirroring the input layout); returns a summary row."""
+    """Computes one run under out_root (mirroring the input layout); returns a summary row.
+
+    A run that doesn't match the baseline is still computed, without its
+    baseline_ratio checks; the row and the outputs say why.
+    """
     ident = identity_from_path(gs_dir)
     out = (out_root / ident["test_name"] / f"run_date={ident['run_date']}" / f"run_ts={ident['run_ts']}"
            / f"run_tag={ident['tag']}")
@@ -346,6 +417,7 @@ def backfill_one(gs_dir: str, config: dict[str, Any], out_root: Path,
     except Exception as e:  # pylint: disable=broad-except
         return {"run": gs_dir, "ok": False, "error": f"{type(e).__name__}: {e}"}
     return {"run": gs_dir, "ok": True, "line": summary_line(result),
+            "baseline_mismatch": mismatch_text(result["baseline"]["mismatch"]),
             **{f"{k}_steady": v["steady"] for k, v in result["modes"].items()}}
 
 
@@ -375,16 +447,16 @@ def cmd_backfill(a: argparse.Namespace) -> int:
 
 
 def cmd_baseline(a: argparse.Namespace) -> int:
-    """Prints a baseline file from 1-user runs: per check field, the median over
-    the clean tasks of all the runs pooled (see baseline_refs)."""
+    """Prints a baseline file from 1-user runs: their identity and, per check
+    field, the median over the clean tasks of all the runs pooled (see baseline_refs)."""
     with tempfile.TemporaryDirectory() as tmp:
         try:
-            dirs = [resolve_run(arg, Path(tmp) / str(i))[0] for i, arg in enumerate(a.runs)]
-            refs, tasks = baseline_refs(dirs)
+            refs, tasks, identity = baseline_refs([resolve_run(arg, Path(tmp) / str(i))
+                                                   for i, arg in enumerate(a.runs)])
         except (OSError, ValueError) as e:
             print(f"baseline: {e}", file=sys.stderr)
             return 1
-    print(json.dumps({"version": BASELINE_VERSION, "refs": refs, "runs": len(a.runs), "tasks": tasks,
+    print(json.dumps({"version": BASELINE_VERSION, **identity, "refs": refs, "runs": len(a.runs), "tasks": tasks,
                       "sources": a.runs}, indent=2, sort_keys=True))
     return 0
 
@@ -405,7 +477,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     b.add_argument("--since", required=True, help="first run_date to include, YYYY-MM-DD")
     b.add_argument("--out", required=True, help="local output root (mirrors the input layout)")
     b.add_argument("--jobs", type=int, default=8, help="runs fetched and computed in parallel")
-    b.add_argument("--baseline", help="saved baseline file applied to every run")
+    b.add_argument("--baseline", help="saved baseline file, used for the runs that match it")
     s = sub.add_parser("baseline", help="print a baseline file from 1-user runs")
     s.add_argument("runs", nargs="+", help="run directories or gs:// run paths")
     a = p.parse_args(argv)
