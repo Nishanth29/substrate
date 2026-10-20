@@ -38,13 +38,17 @@ def in_window(t: Optional[float], window: tuple[float, float]) -> bool:
 
 def window_metrics(rows: list[dict[str, Any]], startup_ts: list[float], episode_ts: list[float],
                    window: tuple[float, float], capacity: dict[str, Optional[float]],
-                   baseline: Optional[dict[str, Any]]) -> dict[str, Any]:
+                   refs: dict[str, float], ratio_fields: list[str]) -> dict[str, Any]:
     """Counts and rates for tasks that belong to the window.
 
-    rows are classified tasks ({"status", "reasons", "end", "first_failure_t", "wall_ms"}).
-    A finished task belongs to the window it ended in, and an unfinished task
-    (always bad) to the window of its first failure. Startup failures are
-    reported as attempts and episodes and stay out of the ratio.
+    rows are classified tasks ({"status", "reasons", "end", "first_failure_t",
+    "wall_ms", "values"}, values being the record's check fields). A finished
+    task belongs to the window it ended in, and an unfinished task (always bad)
+    to the window of its first failure. Startup failures are reported as
+    attempts and episodes and stay out of the ratio.
+
+    For each field in ratio_fields (the applied baseline_ratio checks), the
+    p50/p90/p99 of value / refs[field] over finished tasks with a value.
     """
     length = max(0.0, window[1] - window[0])
     finished = [r for r in rows if in_window(r["end"], window)]
@@ -73,11 +77,11 @@ def window_metrics(rows: list[dict[str, Any]], startup_ts: list[float], episode_
     for key, cap in (("node", capacity.get("node_count")), ("vcpu", capacity.get("allocatable_cores")),
                      ("gb_ram", capacity.get("allocatable_ram_gb"))):
         m[f"good_tasks_per_{key}_hr"] = round(per_hr / cap, 4) if per_hr is not None and cap else None
-    if baseline and baseline.get("wall_ref_ms"):
-        ratios = [r["wall_ms"] / float(baseline["wall_ref_ms"]) for r in finished if r["wall_ms"]]
-        m["wall_ratio_p50"] = percentile(ratios, 50)
-        m["wall_ratio_p90"] = percentile(ratios, 90)
-        m["wall_ratio_p99"] = percentile(ratios, 99)
-        if baseline.get("task_cel_ref_ms") and walls:
-            m["eta_infra"] = round(float(baseline["task_cel_ref_ms"]) / m["good_wall_ms_p50"], 4)
+    for f in ratio_fields:
+        ratios = [r["values"][f] / refs[f] for r in finished if r["values"][f] is not None]
+        for p in (50, 90, 99):
+            m[f"{f}_ratio_p{p}"] = percentile(ratios, p)
+    cel_ref = refs.get("cel_ms")
+    if (cel_ref or 0) > 0 and walls:
+        m["eta_infra"] = round(float(cel_ref) / m["good_wall_ms_p50"], 4)
     return m

@@ -17,8 +17,13 @@
 A finished task is one task record. Each task runs on a fresh actor, so an
 actor that logged a failure before the cut-off but no record is one task that
 never finished.
+
+A task is bad when it failed (G1), or when it breaks one of its mode's checks:
+generic rules over task record fields, against a fixed limit or a ratio of a
+baseline value (see README.md).
 """
 
+import operator
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -31,12 +36,21 @@ REASON_RESUME = "resume_failed"
 REASON_EXECUTE = "execute_failed"
 REASON_SUSPEND = "suspend_failed"
 REASON_FAILED = "failed"  # a failed record without a known fail_step
-REASON_SLOW_RESUME = "slow_resume"
-REASON_SLOW_TTFE = "slow_ttfe"
-REASON_SLOW = "slow"
 
 STEP_REASON = {"resume": REASON_RESUME, "execute": REASON_EXECUTE, "suspend": REASON_SUSPEND}
+FAILURE_REASONS = {*STEP_REASON.values(), REASON_FAILED}
 LINE_STEP = {parse.MSG_RESUME_FAIL: "resume", parse.MSG_EXEC_FAIL: "execute", parse.MSG_SUSPEND_FAIL: "suspend"}
+
+# Task record measurements a check (and a baseline) can use. Not timestamps,
+# ids or fail_cycle, which is a cycle index rather than a measurement.
+CHECK_FIELDS = ("wall_ms", "cel_ms", "resume_max_ms", "ttfe_max_ms", "startup_ms", "think_ms",
+                "retries", "cycles", "steps")
+# A task passes a check when `value op threshold` holds.
+OPS = {"<=": operator.le, "<": operator.lt, ">=": operator.ge, ">": operator.gt}
+CONFIG_VERSION = 2
+CONFIG_KEYS = {"version", "modes"}
+MODE_KEYS = {"checks"}
+CHECK_KEYS = {"field", "op", "limit", "baseline_ratio", "reason"}
 
 
 @dataclass
@@ -127,39 +141,106 @@ def startup_episodes(startup: list[parse.Event], records: list[parse.TaskRecord]
     return starts
 
 
-def match_baseline(baselines: list[dict[str, Any]], runtime: str, machine_type: str,
-                   template: str) -> Optional[dict[str, Any]]:
-    """The first baseline for this runtime and machine type, and template when
-    both the baseline and the run name one."""
-    for b in baselines:
-        if (b.get("runtime"), b.get("machine_type")) != (runtime, machine_type):
-            continue
-        if b.get("template") and template and b["template"] != template:
-            continue
-        return b
-    return None
+def validate_config(cfg: Any) -> None:
+    """Raises ValueError unless cfg is a valid version 2 config.
+
+    Unknown keys are errors, so a version 1 config (g2, s_max, baselines, ...)
+    or a typo fails here instead of passing every task. A mode with an empty
+    checks list judges failures only (G1). Each check in a mode has its own
+    reason, and none reuses a failure reason, so bad-reason counts stay per check.
+    """
+    if not isinstance(cfg, dict):
+        raise ValueError("config: not a JSON object")
+    if unknown := set(cfg) - CONFIG_KEYS:
+        raise ValueError(f"config: unknown keys {sorted(unknown)} (version 1 configs are no longer supported; "
+                         "see README.md)")
+    if "version" in cfg and cfg["version"] != CONFIG_VERSION:
+        raise ValueError(f"config: version {cfg['version']!r}, want {CONFIG_VERSION} (see README.md)")
+    modes = cfg.get("modes")
+    if not isinstance(modes, dict) or not modes:
+        raise ValueError("config: needs a non-empty 'modes' object")
+    for name, mode in modes.items():
+        where = f"config: mode {name!r}"
+        if not isinstance(mode, dict) or set(mode) - MODE_KEYS:
+            raise ValueError(f"{where}: a mode has only 'checks'")
+        checks = mode.get("checks")
+        if not isinstance(checks, list):
+            raise ValueError(f"{where}: needs a 'checks' list (an empty list judges failures only)")
+        for i, c in enumerate(checks):
+            at = f"{where} check {i}"
+            if not isinstance(c, dict):
+                raise ValueError(f"{at}: not an object")
+            if unknown := set(c) - CHECK_KEYS:
+                raise ValueError(f"{at}: unknown keys {sorted(unknown)}")
+            if c.get("field") not in CHECK_FIELDS:
+                raise ValueError(f"{at}: field {c.get('field')!r} is not one of {list(CHECK_FIELDS)}")
+            if c.get("op") not in OPS:
+                raise ValueError(f"{at}: op {c.get('op')!r} is not one of {list(OPS)}")
+            if ("limit" in c) == ("baseline_ratio" in c):
+                raise ValueError(f"{at}: needs exactly one of 'limit' and 'baseline_ratio'")
+            if "limit" in c and not parse.is_number(c["limit"]):
+                raise ValueError(f"{at}: limit must be a number")
+            if "baseline_ratio" in c and not (parse.is_number(c["baseline_ratio"]) and c["baseline_ratio"] > 0):
+                raise ValueError(f"{at}: baseline_ratio must be a positive number")
+            if not isinstance(c.get("reason"), str) or not c["reason"]:
+                raise ValueError(f"{at}: needs a 'reason'")
+        reasons = [c["reason"] for c in checks]
+        if dupes := sorted({r for r in reasons if reasons.count(r) > 1}):
+            raise ValueError(f"{where}: each check needs its own reason; repeated {dupes}")
+        if taken := sorted(set(reasons) & FAILURE_REASONS):
+            raise ValueError(f"{where}: reasons {taken} name failures")
 
 
-def classify(task: Task, mode: dict[str, Any], baseline: Optional[dict[str, Any]]) -> tuple[str, list[str]]:
-    """good or bad, with the reasons of the first gate the task fails.
+def _ref(check: dict[str, Any], refs: Optional[dict[str, float]]) -> Optional[float]:
+    """The baseline value a baseline_ratio check compares against; None when there isn't one above 0."""
+    ref = (refs or {}).get(check["field"])
+    return ref if ref is not None and ref > 0 else None
+
+
+def split_checks(mode: dict[str, Any], refs: Optional[dict[str, float]]) -> tuple[list[str], list[str]]:
+    """Reasons of the mode's checks that apply to this run, and of those skipped
+    because the baseline has no value above 0 for their field. A limit check
+    always applies (a task without the value just isn't judged by it)."""
+    applied, skipped = [], []
+    for c in mode["checks"]:
+        if "baseline_ratio" in c and _ref(c, refs) is None:
+            skipped.append(c["reason"])
+        else:
+            applied.append(c["reason"])
+    return applied, skipped
+
+
+def ratio_fields(mode: dict[str, Any], refs: Optional[dict[str, float]]) -> list[str]:
+    """Fields of the mode's baseline_ratio checks that apply (the baseline has a value above 0), in order."""
+    fields = [c["field"] for c in mode["checks"] if "baseline_ratio" in c and _ref(c, refs) is not None]
+    return list(dict.fromkeys(fields))
+
+
+def classify(task: Task, mode: dict[str, Any], refs: Optional[dict[str, float]]) -> tuple[str, list[str]]:
+    """good or bad, with the reasons.
 
     G1: any failure (an unfinished task has one), named by the first failure.
-    G2, when the mode enables it: the slowest resume and TTFE within their
-    bounds. G3, only with a baseline: wall_ms / wall_ref_ms within s_max.
+    Then every check of the mode, in order: the task is bad with the reason of
+    each check it breaks. A check is skipped when the task has no value for its
+    field, and a baseline_ratio check also when refs has no value above 0.
     """
     if not task.finished:
         return BAD, [STEP_REASON[task.fail_step]]
     r = task.record
     if r.failed:
         return BAD, [STEP_REASON.get(r.fail_step, REASON_FAILED)]
-    if mode.get("g2"):
-        reasons = []
-        if r.resume_max_ms > 1000 * float(mode["resume_max_s"]):
-            reasons.append(REASON_SLOW_RESUME)
-        if r.ttfe_max_ms is not None and r.ttfe_max_ms > 1000 * float(mode["ttfe_max_s"]):
-            reasons.append(REASON_SLOW_TTFE)
-        if reasons:
-            return BAD, reasons
-    if baseline and baseline.get("wall_ref_ms") and r.wall_ms / float(baseline["wall_ref_ms"]) > float(mode["s_max"]):
-        return BAD, [REASON_SLOW]
-    return GOOD, []
+    reasons = []
+    for c in mode["checks"]:
+        value = getattr(r, c["field"])
+        if value is None:
+            continue
+        if "baseline_ratio" in c:
+            ref = _ref(c, refs)
+            if ref is None:
+                continue
+            threshold = float(c["baseline_ratio"]) * ref
+        else:
+            threshold = float(c["limit"])
+        if not OPS[c["op"]](value, threshold):
+            reasons.append(c["reason"])
+    return (BAD, reasons) if reasons else (GOOD, [])

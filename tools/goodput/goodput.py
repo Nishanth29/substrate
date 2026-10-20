@@ -19,8 +19,9 @@ The benchmark only records facts; this script decides good or bad from them, so
 a rule change is a config edit and a rerun. See README.md.
 
   goodput.py compute <run dir | gs://.../run_ts=.../run_tag=.../> [--out DIR]
-  goodput.py backfill <gs://.../runs/sweperf_*> --since YYYY-MM-DD --out DIR [--jobs N]
-  goodput.py baseline <1-user run dir | gs path>... [--runtime R] [--machine-type T] [--template T]
+                     [--baseline FILE | --baseline-run <1-user run>...]   (the run to score goes first)
+  goodput.py backfill <gs://.../runs/sweperf_*> --since YYYY-MM-DD --out DIR [--jobs N] [--baseline FILE]
+  goodput.py baseline <1-user run dir | gs path>...
 """
 
 import argparse
@@ -31,6 +32,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -40,13 +42,19 @@ import metrics  # noqa: E402
 import parse  # noqa: E402
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "config.json"
+BASELINE_VERSION = 1
 RUN_FILES = ("logs.txt", "stats.jsonl", "server_summary.json", "stats_history.csv")
 RUN_PATH = re.compile(r"/runs/(?P<test>[^/]+)/run_date=(?P<date>[^/]+)/run_ts=(?P<ts>\d+)/run_tag=(?P<tag>[^/]+)/?$")
 
 
 def load_config(path: Path) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        config = json.load(f)
+    try:
+        classify.validate_config(config)
+    except ValueError as e:
+        raise ValueError(f"{path}: {e}") from e
+    return config
 
 
 def runtime_of(test_name: str, trial: dict[str, Any]) -> str:
@@ -79,8 +87,21 @@ def steady_window(meta: dict[str, Any], run_dir: Path, log_ts: list[float],
     return window, source
 
 
-def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, str]] = None) -> dict[str, Any]:
-    """goodput.json content for one run directory. identity (from a gs:// run path) wins over the files."""
+@dataclass
+class Run:
+    """One run directory, read and split into tasks: what compute and baseline_refs share."""
+    log: parse.RunLog
+    meta: dict[str, Any]
+    trial_row: dict[str, Any]
+    trial: dict[str, Any]
+    cut: Optional[float]
+    cut_source: str
+    tasks: list[classify.Task]
+    startup: list[parse.Event]
+
+
+def load_run(run_dir: Path) -> Run:
+    """Reads a run and builds its tasks up to the cut-off. Raises for a run without task records."""
     log = parse.read_run(run_dir / "logs.txt")
     if not log.records:
         raise ValueError(f"no '{parse.MSG_TASK_RECORD}' lines in {run_dir / 'logs.txt'}; "
@@ -89,6 +110,21 @@ def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, 
     meta = parse.read_server_metadata(run_dir / "server_summary.json")
     trial_row = stats.get("trial_summary") or {}
     trial = trial_row.get("measurements") or {}
+    cut, cut_source = classify.cutoff(log.events, parse.epoch(trial.get("run_end")), parse.num(meta.get("end_ts")))
+    tasks, startup = classify.build_tasks(log, cut)
+    return Run(log, meta, trial_row, trial, cut, cut_source, tasks, startup)
+
+
+def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, str]] = None,
+            baseline: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """goodput.json content for one run directory. identity (from a gs:// run path) wins over the files.
+
+    baseline is {"source": ..., "refs": {field: value}} from --baseline or
+    --baseline-run; without one, baseline_ratio checks are skipped.
+    """
+    run = load_run(run_dir)
+    log, meta, trial_row, trial, cut, tasks, startup = (run.log, run.meta, run.trial_row, run.trial, run.cut,
+                                                        run.tasks, run.startup)
     ident = identity or {}
     test_name = ident.get("test_name") or meta.get("test_name") or trial_row.get("test_name", "")
     runtime = runtime_of(test_name, trial)
@@ -96,15 +132,13 @@ def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, 
     templates = {r.template for r in log.records if r.template}
     template = str(trial.get("template") or (templates.pop() if len(templates) == 1 else ""))
 
-    cut, cut_source = classify.cutoff(log.events, parse.epoch(trial.get("run_end")), parse.num(meta.get("end_ts")))
-    tasks, startup = classify.build_tasks(log, cut)
     startup_ts = [s.t for s in startup]
     episode_ts = classify.startup_episodes(startup, log.records)
     log_ts = [r.t for r in log.records] + [ev.t for ev in log.events]
     steady, steady_source = steady_window(meta, run_dir, log_ts, cut)
     whole = (parse.num(meta.get("start_ts")) or min(log_ts), cut if cut is not None else max(log_ts))
     capacity = {k: parse.num(trial.get(k)) for k in ("node_count", "allocatable_cores", "allocatable_ram_gb")}
-    baseline = classify.match_baseline(config.get("baselines") or [], runtime, machine_type, template)
+    refs = dict((baseline or {}).get("refs") or {})
 
     task_rows = []
     for t in tasks:
@@ -116,31 +150,34 @@ def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, 
                           "first_failure_t": t.first_failure_t, "fail_step": t.fail_step, "fail_cycle": t.fail_cycle,
                           "status_by_mode": {}, "reasons_by_mode": {}})
     modes: dict[str, Any] = {}
-    for mode_name, mode in sorted((config.get("modes") or {}).items()):
+    for mode_name, mode in sorted(config["modes"].items()):
         rows = []
         for t, row in zip(tasks, task_rows):
-            status, reasons = classify.classify(t, mode, baseline)
+            status, reasons = classify.classify(t, mode, refs)
             row["status_by_mode"][mode_name] = status
             row["reasons_by_mode"][mode_name] = reasons
-            rows.append({**row, "status": status, "reasons": reasons})
+            values = {f: getattr(t.record, f) for f in classify.CHECK_FIELDS} if t.record else {}
+            rows.append({**row, "status": status, "reasons": reasons, "values": values})
+        applied, skipped = classify.split_checks(mode, refs)
+        fields = classify.ratio_fields(mode, refs)
         modes[mode_name] = {
-            "g2": "applied" if mode.get("g2") else "off",
-            "g3_basis": "wall" if baseline and baseline.get("wall_ref_ms") else "skipped",
-            "steady": metrics.window_metrics(rows, startup_ts, episode_ts, steady, capacity, baseline),
-            "whole": metrics.window_metrics(rows, startup_ts, episode_ts, whole, capacity, baseline),
+            "checks_applied": applied,
+            "checks_skipped": skipped,
+            "steady": metrics.window_metrics(rows, startup_ts, episode_ts, steady, capacity, refs, fields),
+            "whole": metrics.window_metrics(rows, startup_ts, episode_ts, whole, capacity, refs, fields),
         }
 
     finished = sum(1 for t in tasks if t.finished)
     return {
-        "version": 1,
+        "version": 2,
         "run": {"test_name": test_name, "tag": ident.get("tag") or meta.get("tag") or trial_row.get("tag", ""),
                 "run_ts": str(ident.get("run_ts") or meta.get("start_ts") or ""),
                 "run_date": ident.get("run_date", ""), "data_timestamp": meta.get("data_timestamp", ""),
                 "runtime": runtime, "machine_type": machine_type, "template": template,
                 "record_version": parse.RECORD_VERSION, **capacity},
-        "cutoff": {"ts": cut, "source": cut_source},
+        "cutoff": {"ts": cut, "source": run.cut_source},
         "steady_window": {"start_ts": steady[0], "end_ts": steady[1], "source": steady_source},
-        "baseline": baseline,
+        "baseline": {"source": (baseline or {}).get("source"), "refs": refs},
         "modes": modes,
         "totals": {"tasks_finished": finished, "tasks_unfinished_bad": len(tasks) - finished,
                    "startup_failure_attempts": len(startup), "startup_failure_episodes": len(episode_ts),
@@ -149,12 +186,54 @@ def compute(run_dir: Path, config: dict[str, Any], identity: Optional[dict[str, 
     }
 
 
+# --- Baselines ------------------------------------------------------------------
+
+def baseline_refs(run_dirs: list[Path]) -> tuple[dict[str, float], int]:
+    """Reference values from 1-user runs, and how many tasks they come from.
+
+    Pools the finished, non-failed tasks of all the runs (built like compute
+    builds them, up to the cut-off) and takes, for each check field, the median
+    over the tasks that logged it. A field no task logged is left out. Applies
+    no checks. Raises when the runs have no clean task.
+    """
+    clean = [t.record for d in run_dirs for t in load_run(d).tasks if t.finished and not t.record.failed]
+    if not clean:
+        raise ValueError("no finished task without failures in the baseline runs")
+    refs = {}
+    for f in classify.CHECK_FIELDS:
+        values = [getattr(r, f) for r in clean if getattr(r, f) is not None]
+        if values:
+            refs[f] = round(float(statistics.median(values)), 3)
+    return refs, len(clean)
+
+
+def load_baseline(path: Path) -> dict[str, Any]:
+    """A saved baseline (from the baseline command) as {"source", "refs"}."""
+    with open(path, encoding="utf-8") as f:
+        j = json.load(f)
+    refs = j.get("refs") if isinstance(j, dict) else None
+    if not isinstance(j, dict) or j.get("version") != BASELINE_VERSION or not isinstance(refs, dict):
+        raise ValueError(f"{path}: not a version {BASELINE_VERSION} baseline with a 'refs' object")
+    for k, v in refs.items():
+        if k not in classify.CHECK_FIELDS or not parse.is_number(v):
+            raise ValueError(f"{path}: refs.{k} must be a check field with a number")
+    return {"source": f"file:{path}", "refs": refs}
+
+
+def baseline_from_runs(args: list[str], tmp: Path) -> dict[str, Any]:
+    """{"source", "refs"} from paired 1-user runs (directories or gs:// paths)."""
+    dirs = [resolve_run(arg, tmp / f"baseline{i}")[0] for i, arg in enumerate(args)]
+    refs, _ = baseline_refs(dirs)
+    return {"source": "run:" + ",".join(args), "refs": refs}
+
+
 def jsonl_rows(result: dict[str, Any]) -> list[dict[str, Any]]:
     """stats.jsonl-shaped rows (string measurements), one per mode; whole-run values get a whole_ prefix."""
     run = result["run"]
     rows = []
     for mode_name, m in sorted(result["modes"].items()):
-        meas = {"g2": m["g2"], "g3_basis": m["g3_basis"], "runtime": run["runtime"],
+        meas = {"checks_applied": ",".join(m["checks_applied"]), "checks_skipped": ",".join(m["checks_skipped"]),
+                "baseline_source": result["baseline"]["source"] or "", "runtime": run["runtime"],
                 "machine_type": run["machine_type"], "template": run["template"]}
         for win, prefix in (("steady", ""), ("whole", "whole_")):
             for k, v in m[win].items():
@@ -236,8 +315,17 @@ def list_runs(prefix: str, since: str) -> list[str]:
 def cmd_compute(a: argparse.Namespace) -> int:
     config = load_config(Path(a.config))
     with tempfile.TemporaryDirectory() as tmp:
+        try:
+            baseline = None
+            if a.baseline:
+                baseline = load_baseline(Path(a.baseline))
+            elif a.baseline_run:
+                baseline = baseline_from_runs(a.baseline_run, Path(tmp))
+        except (OSError, ValueError) as e:
+            print(f"baseline: {e}", file=sys.stderr)
+            return 1
         run_dir, ident = resolve_run(a.run, Path(tmp))
-        result = compute(run_dir, config, ident)
+        result = compute(run_dir, config, ident, baseline)
         out = Path(a.out) if a.out else (Path("goodput-out") if a.run.startswith("gs://") else run_dir)
         write_outputs(result, out)
     print(summary_line(result))
@@ -245,14 +333,15 @@ def cmd_compute(a: argparse.Namespace) -> int:
     return 0
 
 
-def backfill_one(gs_dir: str, config: dict[str, Any], out_root: Path) -> dict[str, Any]:
+def backfill_one(gs_dir: str, config: dict[str, Any], out_root: Path,
+                 baseline: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Computes one run under out_root (mirroring the input layout); returns a summary row."""
     ident = identity_from_path(gs_dir)
     out = (out_root / ident["test_name"] / f"run_date={ident['run_date']}" / f"run_ts={ident['run_ts']}"
            / f"run_tag={ident['tag']}")
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            result = compute(fetch_run(gs_dir, Path(tmp)), config, ident)
+            result = compute(fetch_run(gs_dir, Path(tmp)), config, ident, baseline)
         write_outputs(result, out)
     except Exception as e:  # pylint: disable=broad-except
         return {"run": gs_dir, "ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -262,6 +351,11 @@ def backfill_one(gs_dir: str, config: dict[str, Any], out_root: Path) -> dict[st
 
 def cmd_backfill(a: argparse.Namespace) -> int:
     config = load_config(Path(a.config))
+    try:
+        baseline = load_baseline(Path(a.baseline)) if a.baseline else None
+    except (OSError, ValueError) as e:
+        print(f"baseline: {e}", file=sys.stderr)
+        return 1
     out_root = Path(a.out)
     runs = list_runs(a.prefix, a.since)
     print(f"{len(runs)} runs since {a.since}", flush=True)
@@ -269,7 +363,7 @@ def cmd_backfill(a: argparse.Namespace) -> int:
     failed = 0
     with open(out_root / "backfill_summary.jsonl", "w", encoding="utf-8") as summary, \
             concurrent.futures.ThreadPoolExecutor(max_workers=max(1, a.jobs)) as pool:
-        for row in pool.map(lambda d: backfill_one(d, config, out_root), runs):
+        for row in pool.map(lambda d: backfill_one(d, config, out_root, baseline), runs):
             if row["ok"]:
                 print(row.pop("line"), flush=True)
             else:
@@ -281,58 +375,39 @@ def cmd_backfill(a: argparse.Namespace) -> int:
 
 
 def cmd_baseline(a: argparse.Namespace) -> int:
-    """A baselines[] entry from 1-user runs: the median wall time of finished tasks
-    without failures, and the request-weighted mean of actor_TaskCEL medians."""
-    config = dict(load_config(Path(a.config)), baselines=[])
-    walls: list[float] = []
-    cels: list[tuple[float, float]] = []  # (TaskCEL median ms, request count)
-    seen: dict[str, set[str]] = {"runtime": set(), "machine_type": set(), "template": set()}
+    """Prints a baseline file from 1-user runs: per check field, the median over
+    the clean tasks of all the runs pooled (see baseline_refs)."""
     with tempfile.TemporaryDirectory() as tmp:
-        for i, arg in enumerate(a.runs):
-            run_dir, ident = resolve_run(arg, Path(tmp) / str(i))
-            run = compute(run_dir, config, ident)
-            for key in seen:
-                seen[key].add(run["run"][key])
-            walls += [t["wall_ms"] for t in run["tasks"] if not t["failed"]]
-            cel = (parse.read_stats(run_dir / "stats.jsonl").get("actor_TaskCEL") or {}).get("measurements") or {}
-            med, n = parse.num(cel.get("median_response_time")), parse.num(cel.get("request_count"))
-            if med and n:
-                cels.append((med, n))
-    entry: dict[str, Any] = {"runs": len(a.runs), "tasks": len(walls)}
-    for key, override in (("runtime", a.runtime), ("machine_type", a.machine_type), ("template", a.template)):
-        if override:
-            entry[key] = override
-        elif len(seen[key]) == 1:
-            entry[key] = seen[key].pop()
-        else:
-            print(f"the runs disagree on {key}: {sorted(seen[key])}", file=sys.stderr)
+        try:
+            dirs = [resolve_run(arg, Path(tmp) / str(i))[0] for i, arg in enumerate(a.runs)]
+            refs, tasks = baseline_refs(dirs)
+        except (OSError, ValueError) as e:
+            print(f"baseline: {e}", file=sys.stderr)
             return 1
-    if not walls:
-        print("no finished task without failures in these runs", file=sys.stderr)
-        return 1
-    entry["wall_ref_ms"] = round(statistics.median(walls), 1)
-    entry["task_cel_ref_ms"] = round(sum(m * n for m, n in cels) / sum(n for _, n in cels), 1) if cels else None
-    print(json.dumps(entry, indent=2, sort_keys=True))
+    print(json.dumps({"version": BASELINE_VERSION, "refs": refs, "runs": len(a.runs), "tasks": tasks,
+                      "sources": a.runs}, indent=2, sort_keys=True))
     return 0
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", default=str(DEFAULT_CONFIG), help="rules and baselines (default: %(default)s)")
+    p.add_argument("--config", default=str(DEFAULT_CONFIG), help="modes and their checks (default: %(default)s)")
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("compute", help="one run: write goodput.json and goodput.jsonl")
     c.add_argument("run", help="run directory or gs:// run path")
     c.add_argument("--out", help="output directory (default: the run directory; ./goodput-out for gs://)")
+    cb = c.add_mutually_exclusive_group()
+    cb.add_argument("--baseline", help="saved baseline file (from the baseline command)")
+    cb.add_argument("--baseline-run", nargs="+", metavar="RUN",
+                    help="paired 1-user run directories or gs:// paths, pooled into one baseline")
     b = sub.add_parser("backfill", help="every run under a gs:// prefix since a date (local output only)")
     b.add_argument("prefix", help="e.g. gs://<bucket>/<prefix>/runs/sweperf_*")
     b.add_argument("--since", required=True, help="first run_date to include, YYYY-MM-DD")
     b.add_argument("--out", required=True, help="local output root (mirrors the input layout)")
     b.add_argument("--jobs", type=int, default=8, help="runs fetched and computed in parallel")
-    s = sub.add_parser("baseline", help="print a baselines[] entry from 1-user runs")
+    b.add_argument("--baseline", help="saved baseline file applied to every run")
+    s = sub.add_parser("baseline", help="print a baseline file from 1-user runs")
     s.add_argument("runs", nargs="+", help="run directories or gs:// run paths")
-    s.add_argument("--runtime", default="", help="default: the runs' runtime")
-    s.add_argument("--machine-type", default="", help="default: the runs' trial_summary machine_type")
-    s.add_argument("--template", default="", help="default: the runs' template, if any")
     a = p.parse_args(argv)
     return {"compute": cmd_compute, "backfill": cmd_backfill, "baseline": cmd_baseline}[a.cmd](a)
 

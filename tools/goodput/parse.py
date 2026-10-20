@@ -51,7 +51,10 @@ class Event:
 
 @dataclass
 class TaskRecord:
-    """One "sweperf task record" line. Durations in ms, times in unix seconds."""
+    """One "sweperf task record" line. Durations in ms, times in unix seconds.
+
+    Optional fields are None when the record doesn't log them; a logged 0 stays 0.
+    """
     t: float  # when the line was logged
     actor: str
     end: float
@@ -61,13 +64,13 @@ class TaskRecord:
     failed: bool
     user: Optional[int] = None
     template: str = ""
-    cycles: int = 0
-    steps: int = 0
+    cycles: Optional[int] = None
+    steps: Optional[int] = None
     task_start: Optional[float] = None
-    startup_ms: float = 0.0
-    think_ms: float = 0.0
+    startup_ms: Optional[float] = None
+    think_ms: Optional[float] = None
     ttfe_max_ms: Optional[float] = None
-    retries: int = 0
+    retries: Optional[int] = None
     fail_step: str = ""
     fail_cycle: Optional[int] = None  # None unless the task failed
 
@@ -101,14 +104,19 @@ def _json_line(line: str) -> Optional[dict[str, Any]]:
     return j if isinstance(j, dict) else None
 
 
+def is_number(v: Any) -> bool:
+    """A JSON number; bools are not."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
 def _int(v: Any) -> Optional[int]:
     """An int from a JSON number; None for anything else, bools included."""
-    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    return int(v) if is_number(v) else None
 
 
 def _float(v: Any) -> Optional[float]:
     """A float from a JSON number; None for anything else, bools included."""
-    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+    return float(v) if is_number(v) else None
 
 
 def parse_line(line: str) -> Optional[Event]:
@@ -153,10 +161,10 @@ def parse_record(line: str) -> Optional[TaskRecord]:
         raise ValueError("task record missing actor, failed, wall_ms, cel_ms or resume_max_ms")
     return TaskRecord(
         t=t, actor=actor, end=end, wall_ms=wall, cel_ms=cel, resume_max_ms=resume, failed=failed,
-        user=_int(j.get("user")), template=str(j.get("template") or ""), cycles=_int(j.get("cycles")) or 0,
-        steps=_int(j.get("steps")) or 0, task_start=task_start, startup_ms=_float(j.get("startup_ms")) or 0.0,
-        think_ms=_float(j.get("think_ms")) or 0.0, ttfe_max_ms=_float(j.get("ttfe_max_ms")),
-        retries=_int(j.get("retries")) or 0, fail_step=str(j.get("fail_step") or ""),
+        user=_int(j.get("user")), template=str(j.get("template") or ""), cycles=_int(j.get("cycles")),
+        steps=_int(j.get("steps")), task_start=task_start, startup_ms=_float(j.get("startup_ms")),
+        think_ms=_float(j.get("think_ms")), ttfe_max_ms=_float(j.get("ttfe_max_ms")),
+        retries=_int(j.get("retries")), fail_step=str(j.get("fail_step") or ""),
         # Cycles are 1-based; the benchmark logs fail_cycle 0 for a task that didn't fail.
         fail_cycle=(_int(j.get("fail_cycle")) or None) if failed else None)
 
@@ -180,7 +188,7 @@ def read_run(path: Path) -> RunLog:
 
 
 def read_stats(path: Path) -> dict[str, dict[str, Any]]:
-    """stats.jsonl rows by metric name (trial_summary, actor_TaskCEL, ...)."""
+    """stats.jsonl rows by metric name (trial_summary, ...)."""
     rows: dict[str, dict[str, Any]] = {}
     if not path.exists():
         return rows

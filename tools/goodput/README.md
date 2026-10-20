@@ -5,7 +5,8 @@ per hour, per node, per vCPU and per GB of RAM, and why the bad ones were bad.
 The task logs it reads are currently the sweperf benchmark's.
 
 The benchmark only records facts; this script decides good or bad from them. A
-rule change is an edit to `config.json` and a rerun, with no new benchmark run.
+rule change is a config edit (`config.json`, or a per-test file passed with
+`--config`) and a rerun, with no new benchmark run.
 Follow-up work is tracked in #2837.
 
 Python 3.10+, standard library only. GCS access goes through `gcloud storage`.
@@ -13,21 +14,23 @@ Python 3.10+, standard library only. GCS access goes through `gcloud storage`.
 ## Commands
 
 ```sh
-# One run, local directory or a run path in GCS.
-tools/goodput/goodput.py compute <run dir | gs://.../run_date=.../run_ts=.../run_tag=.../> [--out DIR]
+# One run, local directory or a run path in GCS. The run to score goes first.
+tools/goodput/goodput.py compute <run dir | gs://.../run_date=.../run_ts=.../run_tag=.../> [--out DIR] \
+    [--baseline FILE | --baseline-run <1-user run>...]
 
 # Every run under a prefix since a date. Writes locally only, mirroring the input layout.
-tools/goodput/goodput.py backfill 'gs://<bucket>/<prefix>/runs/sweperf_*' --since 2026-10-17 --out /tmp/goodput
+tools/goodput/goodput.py backfill 'gs://<bucket>/<prefix>/runs/sweperf_*' --since 2026-10-17 --out /tmp/goodput \
+    [--baseline FILE]
 
-# A baselines[] entry from 1-user runs (median wall time of tasks without failures, task CEL).
-tools/goodput/goodput.py baseline <1-user run>...
+# A baseline file from 1-user runs.
+tools/goodput/goodput.py baseline <1-user run>... > baseline.json
 ```
 
-`--config` selects a different rules file (default `config.json` next to the script).
+`--config` selects a different config file (default `config.json` next to the script).
 
 ## Running it
 
-- **Automated runs** will get goodput from a step after each test (not from the runner); that step is a follow-up (#2838).
+- **Automated runs** will run goodput from `runner.py` after each test (#2838).
 - **Runs on your own cluster:** `tools/goodput/goodput.py compute <dest>/runs/<name>/run_date=<YYYY-MM-DD>/run_ts=<ts>/run_tag=<tag>/`,
   the directory `runner.py` writes `logs.txt`, `stats.jsonl` and `server_summary.json` to.
 
@@ -55,7 +58,7 @@ aren't supported: `compute` fails on a `logs.txt` without task records.
   failed in step", "execute steps failed" or "SuspendActor failed") before the
   cut-off and no task record.
 - Task records of another version, or missing a required field, are skipped and
-  counted in `skipped_records`.
+  counted in `skipped_records`. Optional fields a record doesn't log are `null`.
 
 **Cut-off.** This is when the load stopped. Failures after it are teardown, not
 part of a user's task. The first available of:
@@ -67,19 +70,16 @@ part of a user's task. The first available of:
 Interrupted tasks log no record, so a record logged just after the cut-off still
 counts; its end is taken as the cut-off.
 
-**Good or bad.** A bad task gets the reasons of the first gate it fails.
-- **G1, no failure.** A record with `failed: true` is bad (`resume_failed`,
+**Good or bad.**
+- **Failures (G1).** A record with `failed: true` is bad (`resume_failed`,
   `execute_failed`, `suspend_failed` from its `fail_step`, else `failed`). A
   resume that failed and was retried successfully still makes the task bad, the
   same rule as the benchmark's `TaskCEL`/`TaskWallClock` failures. A task that
-  never finished is always bad, named by its first failure line.
-- **G2, responsiveness (strict mode).** The record's `resume_max_ms` ≤
-  `resume_max_s` (`slow_resume`) and `ttfe_max_ms` ≤ `ttfe_max_s` (`slow_ttfe`).
-  A task without `ttfe_max_ms` (no cycle got an asynchronous ack) is only held
-  to the resume bound.
-- **G3, slowness.** Wall time ÷ the baseline's `wall_ref_ms` ≤ `s_max` (`slow`).
-  It only applies when `config.json` has a baseline for the run's runtime and
-  machine type (`g3_basis: wall`); otherwise it's `skipped`.
+  never finished is always bad, named by its first failure line. A failed task
+  gets only its failure reason.
+- **Checks.** A task that didn't fail is then held to every check of the mode
+  (see Config). It is bad with the reason of each check it breaks, in config
+  order.
 - **Startup failures** ("sweperf on_start failed") are reported as attempts and
   as episodes: a user's consecutive startup failures until its next task record.
   They stay out of the ratio.
@@ -92,35 +92,89 @@ counts; its end is taken as the cut-off.
   It ends at the cut-off at the latest.
 - `whole` runs from the run start to the cut-off.
 
+## Config (`config.json`)
+
+```json
+{
+  "version": 2,
+  "modes": {
+    "strict": {
+      "checks": [
+        {"field": "resume_max_ms", "op": "<=", "limit": 1500, "reason": "slow_resume"},
+        {"field": "cel_ms", "op": "<=", "baseline_ratio": 1.5, "reason": "slow_cel"}
+      ]
+    }
+  }
+}
+```
+
+- `modes`: each mode has a list of `checks`. An empty list judges failures only.
+- A check passes when `<field> <op> <threshold>` holds for the task's record.
+  - `field`: `wall_ms`, `cel_ms`, `resume_max_ms`, `ttfe_max_ms`, `startup_ms`,
+    `think_ms`, `retries`, `cycles` or `steps`.
+  - `op`: `<=`, `<`, `>=` or `>`.
+  - Exactly one of `limit` (any number) and `baseline_ratio` (a number above 0;
+    the threshold is the ratio times the baseline's value for the field).
+  - `reason`: the name a bad task gets, unique within the mode and different
+    from the failure reasons.
+- A task without a value for the field isn't judged by that check. A
+  `baseline_ratio` check is skipped when there is no baseline value above 0 for
+  its field; the mode lists it in `checks_skipped`.
+- Unknown keys and a `version` other than 2 are errors.
+
+The default modes:
+- strict: `resume_max_ms` ≤ 1500, `ttfe_max_ms` ≤ 1000, and `cel_ms` and
+  `wall_ms` ≤ 1.5× the baseline;
+- relaxed: `cel_ms` and `wall_ms` ≤ 2× the baseline.
+
+The resume and TTFE limits are placeholders until #2843, and the ratios until
+the 1-user baselines (#2841). `ttfe_max_ms` currently includes the resume (#2843).
+
+## Baselines
+
+A baseline holds reference values for `baseline_ratio` checks:
+
+```json
+{"version": 1, "refs": {"cel_ms": 6000.0, "wall_ms": 8000.0}}
+```
+
+`goodput.py baseline` prints one from 1-user runs. It pools the tasks that
+finished without failures from all the runs, and takes the median of each
+check field over the tasks that logged it. A field no task logged is left out.
+The file also records `runs`, `tasks` and `sources`, to show where it came from.
+
+- `compute --baseline-run <run>...` builds the baseline from the given runs
+  directly. The best baseline is a 1-user run paired with the test, on the same
+  cluster.
+- `compute --baseline FILE` and `backfill --baseline FILE` read a saved one. In
+  a backfill, the one baseline applies to every run.
+
+Without a baseline, `baseline_ratio` checks are skipped.
+
 ## Outputs
 
 `goodput.json`:
-- `run`, `cutoff`, `steady_window`, `baseline`;
-- per mode (`strict`, `relaxed`): `g2` (`applied` or `off`), `g3_basis`, and per
-  window (`steady`, `whole`):
+- `version` (2), `run`, `cutoff`, `steady_window`;
+- `baseline`: `source` (`file:<path>`, `run:<paths>` or `null`) and `refs`;
+- per mode (`strict`, `relaxed`): `checks_applied` and `checks_skipped` (check
+  reasons), and per window (`steady`, `whole`):
   - `tasks_done`, `tasks_good`, `tasks_bad`, `tasks_unfinished_bad`, `bad_reasons`,
     `startup_failure_attempts`, `startup_failure_episodes`;
   - `good_tasks_per_hr`, and per node/vCPU/GB-RAM hour;
   - `goodput_ratio_pct` = good ÷ (done + unfinished bad);
   - wall-time percentiles of good tasks;
-  - with a baseline: wall ratio percentiles and `eta_infra` (reference CEL ÷ median wall);
+  - `<field>_ratio_p50/p90/p99` (value ÷ baseline) for each applied
+    `baseline_ratio` check;
+  - `eta_infra` (the baseline's `cel_ms` ÷ median wall time of good tasks) when
+    the baseline's `cel_ms` is above 0;
 - `totals` over the whole log;
 - `tasks`: one row per task (actor, user, end, wall and CEL time, slowest resume
   and TTFE, retries, first failure, status and reasons per mode).
 
 `goodput.jsonl`: one row per mode, shaped like `stats.jsonl` (`metric` =
 `goodput_strict` / `goodput_relaxed`, string `measurements`). Whole-run values
-carry a `whole_` prefix.
-
-## Config (`config.json`)
-
-- `modes`: thresholds per mode, placeholders until calibrated.
-  - strict: G2 on, `ttfe_max_s` 1.0, `resume_max_s` 1.5, `s_max` 1.5;
-  - relaxed: G2 off, `s_max` 2.0.
-- `baselines`: `{runtime, machine_type, template, wall_ref_ms, task_cel_ref_ms}`
-  entries, printed by `goodput.py baseline`. `template` is matched only when both
-  the baseline and the run name one; the run's template comes from
-  `trial_summary`, else from its task records.
+carry a `whole_` prefix. `checks_applied` and `checks_skipped` are
+comma-separated, and `baseline_source` is empty without a baseline.
 
 ## Tests
 

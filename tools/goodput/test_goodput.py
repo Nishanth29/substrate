@@ -22,6 +22,7 @@ Stdlib only.
 import contextlib
 import io
 import json
+import re
 import sys
 import tempfile
 import time
@@ -168,6 +169,13 @@ class ParseTest(unittest.TestCase):
         r = parse.parse_record(record(5, failed=True, fail_step="suspend", fail_cycle=3, retries=2, ttfe_max_ms=None))
         self.assertEqual((r.failed, r.fail_step, r.fail_cycle, r.retries, r.ttfe_max_ms), (True, "suspend", 3, 2, None))
 
+    def test_missing_optional_fields_are_none(self):
+        missing = ("cycles", "steps", "startup_ms", "think_ms", "retries", "ttfe_max_ms")
+        r = parse.parse_record(record(5, **dict.fromkeys(missing)))
+        self.assertEqual([getattr(r, f) for f in missing], [None] * len(missing))
+        z = parse.parse_record(record(5, cycles=0, steps=0, startup_ms=0, think_ms=0, retries=0, ttfe_max_ms=0))
+        self.assertEqual([getattr(z, f) for f in missing], [0] * len(missing))
+
     def test_unusable_records_raise(self):
         for bad in (record(5, v=2), record(5, actor=""), record(5, wall_ms="12s"), record(5, failed="no"),
                     record(5, end=None), record(5, time="yesterday")):
@@ -242,39 +250,122 @@ class TaskTest(unittest.TestCase):
         self.assertEqual(classify.cutoff([], None, None), (None, "none"))
 
 
-class GateTest(unittest.TestCase):
-    BASE = {"runtime": "gvisor", "machine_type": "m", "wall_ref_ms": 10000}
+class CheckTest(unittest.TestCase):
+    REFS = {"cel_ms": 4000.0, "wall_ms": 5000.0}  # the default task: cel_ms 6000 (1.5x), wall_ms 8000 (1.6x)
 
     def test_g1_from_the_record(self):
         self.assertEqual(classify.classify(task(failed=True, fail_step="suspend", fail_cycle=3), RELAXED, None),
                          (classify.BAD, [classify.REASON_SUSPEND]))
         self.assertEqual(classify.classify(task(failed=True), RELAXED, None), (classify.BAD, [classify.REASON_FAILED]))
         slow_and_failed = task(failed=True, fail_step="execute", resume_max_ms=9000.0)
-        self.assertEqual(classify.classify(slow_and_failed, STRICT, None), (classify.BAD, [classify.REASON_EXECUTE]))
+        self.assertEqual(classify.classify(slow_and_failed, STRICT, self.REFS),
+                         (classify.BAD, [classify.REASON_EXECUTE]))
 
-    def test_g2_in_strict_mode_only(self):
+    def test_limit_checks(self):
         slow = task(resume_max_ms=1600.0, ttfe_max_ms=1100.0)
-        self.assertEqual(classify.classify(slow, STRICT, None),
-                         (classify.BAD, [classify.REASON_SLOW_RESUME, classify.REASON_SLOW_TTFE]))
+        self.assertEqual(classify.classify(slow, STRICT, None), (classify.BAD, ["slow_resume", "slow_ttfe"]))
         self.assertEqual(classify.classify(slow, RELAXED, None), (classify.GOOD, []))
         self.assertEqual(classify.classify(task(resume_max_ms=1500.0, ttfe_max_ms=None), STRICT, None),
                          (classify.GOOD, []))
 
-    def test_g3_with_a_baseline_after_g2(self):
-        t = task(wall_ms=17000.0)
-        self.assertEqual(classify.classify(t, STRICT, None), (classify.GOOD, []))
-        self.assertEqual(classify.classify(t, STRICT, self.BASE), (classify.BAD, [classify.REASON_SLOW]))
-        self.assertEqual(classify.classify(t, RELAXED, self.BASE), (classify.GOOD, []))
-        self.assertEqual(classify.classify(task(wall_ms=17000.0, resume_max_ms=1600.0), STRICT, self.BASE),
-                         (classify.BAD, [classify.REASON_SLOW_RESUME]))
+    def test_ops(self):
+        def status(op: str, retries: int) -> str:
+            mode = {"checks": [{"field": "retries", "op": op, "limit": 2, "reason": "r"}]}
+            return classify.classify(task(retries=retries), mode, None)[0]
+        good, bad = classify.GOOD, classify.BAD
+        want = {"<=": (good, good, bad), "<": (good, bad, bad), ">=": (bad, good, good), ">": (bad, bad, good)}
+        for op, statuses in want.items():
+            self.assertEqual(tuple(status(op, n) for n in (1, 2, 3)), statuses, op)
 
-    def test_match_baseline(self):
-        bs = [{"runtime": "gvisor", "machine_type": "a", "template": "t1"}, {"runtime": "microvm", "machine_type": "a"}]
-        self.assertIs(classify.match_baseline(bs, "gvisor", "a", "t1"), bs[0])
-        self.assertIsNone(classify.match_baseline(bs, "gvisor", "a", "t2"))
-        self.assertIs(classify.match_baseline(bs, "gvisor", "a", ""), bs[0])  # run names no template
-        self.assertIs(classify.match_baseline(bs, "microvm", "a", "anything"), bs[1])
-        self.assertIsNone(classify.match_baseline(bs, "gvisor", "b", "t1"))
+    def test_limit_of_zero(self):
+        mode = {"checks": [{"field": "retries", "op": "<=", "limit": 0, "reason": "retried"}]}
+        self.assertEqual(classify.classify(task(retries=0), mode, None), (classify.GOOD, []))
+        self.assertEqual(classify.classify(task(retries=1), mode, None), (classify.BAD, ["retried"]))
+
+    def test_baseline_ratio_checks(self):
+        self.assertEqual(classify.classify(task(), STRICT, None), (classify.GOOD, []))
+        self.assertEqual(classify.classify(task(), STRICT, self.REFS), (classify.BAD, ["slow_wall"]))
+        self.assertEqual(classify.classify(task(), RELAXED, self.REFS), (classify.GOOD, []))
+        self.assertEqual(classify.classify(task(cel_ms=6001.0), STRICT, self.REFS),
+                         (classify.BAD, ["slow_cel", "slow_wall"]))
+
+    def test_every_failing_check_is_a_reason(self):
+        t = task(ttfe_max_ms=1200.0, cel_ms=7000.0)
+        self.assertEqual(classify.classify(t, STRICT, self.REFS),
+                         (classify.BAD, ["slow_ttfe", "slow_cel", "slow_wall"]))
+
+    def test_baseline_ratio_checks_skip_without_a_usable_ref(self):
+        for refs in (None, {}, {"cel_ms": 0, "wall_ms": -1}, {"retries": 5}):
+            self.assertEqual(classify.classify(task(), STRICT, refs), (classify.GOOD, []), refs)
+            self.assertEqual(classify.split_checks(STRICT, refs),
+                             (["slow_resume", "slow_ttfe"], ["slow_cel", "slow_wall"]), refs)
+            self.assertEqual(classify.ratio_fields(STRICT, refs), [], refs)
+        self.assertEqual(classify.split_checks(STRICT, self.REFS),
+                         (["slow_resume", "slow_ttfe", "slow_cel", "slow_wall"], []))
+        self.assertEqual(classify.ratio_fields(STRICT, {"wall_ms": 5000.0}), ["wall_ms"])
+
+    def test_limit_check_applies_when_no_task_has_the_value(self):
+        mode = {"checks": [{"field": "ttfe_max_ms", "op": "<=", "limit": 1000, "reason": "slow_ttfe"}]}
+        self.assertEqual(classify.classify(task(ttfe_max_ms=None), mode, None), (classify.GOOD, []))
+        self.assertEqual(classify.split_checks(mode, None), (["slow_ttfe"], []))
+
+    def test_failures_only_mode(self):
+        mode = {"checks": []}
+        self.assertEqual(classify.classify(task(resume_max_ms=9000.0), mode, None), (classify.GOOD, []))
+        self.assertEqual(classify.classify(task(failed=True, fail_step="resume"), mode, None),
+                         (classify.BAD, [classify.REASON_RESUME]))
+        self.assertEqual(classify.split_checks(mode, None), ([], []))
+
+
+class ConfigTest(unittest.TestCase):
+    @staticmethod
+    def config(*checks: dict, **top) -> dict:
+        return {**top, "modes": {"m": {"checks": list(checks)}}}
+
+    @staticmethod
+    def check(**kw) -> dict:
+        c = {"field": "cel_ms", "op": "<=", "limit": 1, "reason": "x"}
+        c.update(kw)
+        return {k: v for k, v in c.items() if v is not None}
+
+    def test_valid(self):
+        classify.validate_config(CONFIG)
+        classify.validate_config(self.config())  # no version; failures only
+        classify.validate_config(self.config(self.check(field="retries", limit=-1), version=2))
+
+    def test_invalid(self):
+        c = self.check
+        cases = {
+            "unknown keys": {"version": 1, "modes": {"strict": {"g2": True, "s_max": 1.5}}, "baselines": []},
+            "version 1": self.config(c(), version=1),
+            "version '2'": self.config(c(), version="2"),
+            "'modes'": {"version": 2},
+            "only 'checks'": {"modes": {"m": {"g2": True, "checks": []}}},
+            "'checks' list": {"modes": {"m": {}}},
+            "unknown keys ['extra']": self.config(c(extra=1)),
+            "field 'fail_cycle'": self.config(c(field="fail_cycle")),
+            "field 'failed'": self.config(c(field="failed")),
+            "op '=='": self.config(c(op="==")),
+            "exactly one": self.config(c(baseline_ratio=2)),
+            "exactly one of": self.config(c(limit=None)),
+            "limit must be a number": self.config(c(limit=True)),
+            "limit must be": self.config(c(limit="1")),
+            "baseline_ratio must be a positive number": self.config(c(limit=None, baseline_ratio=0)),
+            "baseline_ratio must be": self.config(c(limit=None, baseline_ratio=True)),
+            "needs a 'reason'": self.config(c(reason=None)),
+            "own reason": self.config(c(), c(field="wall_ms")),
+            "name failures": self.config(c(reason="resume_failed")),
+        }
+        for message, cfg in cases.items():
+            with self.assertRaisesRegex(ValueError, re.escape(message), msg=message):
+                classify.validate_config(cfg)
+
+    def test_load_config_names_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.json"
+            path.write_text(json.dumps({"version": 1, "modes": {"strict": {"g2": True}}}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, re.escape(str(path))):
+                goodput.load_config(path)
 
 
 class MetricsTest(unittest.TestCase):
@@ -287,11 +378,11 @@ class MetricsTest(unittest.TestCase):
         def row(status, end=None, ff=None, reasons=(), wall=1000.0):
             return {"status": status, "end": end, "first_failure_t": ff, "reasons": list(reasons), "wall_ms": wall}
         rows = [row(classify.GOOD, end=100), row(classify.GOOD, end=200), row(classify.GOOD, end=4000),
-                row(classify.BAD, end=300, reasons=[classify.REASON_SLOW_RESUME]),
+                row(classify.BAD, end=300, reasons=["slow_resume"]),
                 row(classify.BAD, ff=400, reasons=[classify.REASON_EXECUTE, classify.REASON_SUSPEND]),
                 row(classify.BAD, ff=5000, reasons=[classify.REASON_RESUME])]
         m = metrics.window_metrics(rows, [50, 60, 6000], [50, 6000], (0, 3600),
-                                   {"node_count": 2, "allocatable_cores": 100, "allocatable_ram_gb": 400}, None)
+                                   {"node_count": 2, "allocatable_cores": 100, "allocatable_ram_gb": 400}, {}, [])
         self.assertEqual((m["tasks_done"], m["tasks_good"], m["tasks_bad"], m["tasks_unfinished_bad"]), (3, 2, 1, 1))
         # the unfinished task whose first failure is outside the window is not counted
         self.assertEqual(m["bad_reasons"], {"execute_failed": 1, "slow_resume": 1, "suspend_failed": 1})
@@ -300,15 +391,22 @@ class MetricsTest(unittest.TestCase):
                          (1.0, 0.02, 0.005))
         self.assertEqual(m["goodput_ratio_pct"], 50.0)  # 2 good / (3 done + 1 unfinished bad)
         self.assertEqual((m["startup_failure_attempts"], m["startup_failure_episodes"]), (2, 1))
+        self.assertNotIn("eta_infra", m)
 
     def test_baseline_ratios(self):
-        rows = [{"status": classify.GOOD, "end": 10, "first_failure_t": None, "reasons": [], "wall_ms": w}
-                for w in (10000.0, 20000.0)]
-        m = metrics.window_metrics(rows, [], [], (0, 100), {}, {"wall_ref_ms": 10000, "task_cel_ref_ms": 7500})
-        self.assertEqual((m["wall_ratio_p50"], m["eta_infra"]), (1.5, 0.5))
+        rows = [{"status": classify.GOOD, "end": 10, "first_failure_t": None, "reasons": [], "wall_ms": w,
+                 "values": {"wall_ms": w, "cel_ms": c}} for w, c in ((10000.0, 6000.0), (20000.0, None))]
+        refs = {"wall_ms": 10000.0, "cel_ms": 7500.0}
+        m = metrics.window_metrics(rows, [], [], (0, 100), {}, refs, ["wall_ms", "cel_ms"])
+        self.assertEqual((m["wall_ms_ratio_p50"], m["cel_ms_ratio_p50"]), (1.5, 0.8))  # cel_ms: one task has it
+        self.assertEqual(m["eta_infra"], 0.5)  # 7500 / 15000
+        self.assertNotIn("resume_max_ms_ratio_p50", m)
+        m = metrics.window_metrics(rows, [], [], (0, 100), {}, {"cel_ms": 0}, [])
+        self.assertNotIn("eta_infra", m)
+        self.assertNotIn("wall_ms_ratio_p50", m)
 
     def test_empty_window(self):
-        m = metrics.window_metrics([], [], [], (10, 10), {}, None)
+        m = metrics.window_metrics([], [], [], (10, 10), {}, {}, [])
         self.assertIsNone(m["good_tasks_per_hr"])
         self.assertIsNone(m["goodput_ratio_pct"])
 
@@ -347,7 +445,10 @@ class ComputeTest(unittest.TestCase):
         self.assertEqual(r["totals"], {"tasks_finished": 4, "tasks_unfinished_bad": 1, "startup_failure_attempts": 1,
                                        "startup_failure_episodes": 1, "skipped_records": 0, "actors": 5})
         strict, relaxed = r["modes"]["strict"], r["modes"]["relaxed"]
-        self.assertEqual((strict["g2"], relaxed["g2"], strict["g3_basis"]), ("applied", "off", "skipped"))
+        self.assertEqual((r["version"], r["baseline"]), (2, {"source": None, "refs": {}}))
+        self.assertEqual((strict["checks_applied"], strict["checks_skipped"]),
+                         (["slow_resume", "slow_ttfe"], ["slow_cel", "slow_wall"]))
+        self.assertEqual((relaxed["checks_applied"], relaxed["checks_skipped"]), ([], ["slow_cel", "slow_wall"]))
         st = strict["steady"]
         self.assertEqual((st["tasks_done"], st["tasks_good"], st["tasks_bad"], st["tasks_unfinished_bad"]),
                          (4, 3, 1, 1))
@@ -363,21 +464,26 @@ class ComputeTest(unittest.TestCase):
         self.assertTrue(all(isinstance(v, str) for x in rows for v in x["measurements"].values()))
         self.assertEqual((rows[1]["measurements"]["tasks_good"], rows[1]["measurements"]["bad_slow_resume"],
                           rows[1]["measurements"]["whole_tasks_good"]), ("3", "1", "3"))
+        self.assertEqual((rows[1]["measurements"]["checks_applied"], rows[1]["measurements"]["checks_skipped"],
+                          rows[0]["measurements"]["checks_applied"], rows[1]["measurements"]["baseline_source"]),
+                         ("slow_resume,slow_ttfe", "slow_cel,slow_wall", "", ""))
 
     def test_compute_needs_task_records(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, "task record"):
                 goodput.compute(write_run(Path(tmp), [REAL["start"], REAL["quit"]], {}), CONFIG)
 
-    def test_compute_uses_a_matching_baseline(self):
-        base = {"runtime": "gvisor", "machine_type": "c3-highcpu-88", "wall_ref_ms": 4000}
+    def test_compute_with_a_baseline(self):
+        baseline = {"source": "file:base.json", "refs": {"wall_ms": 4000.0, "cel_ms": 6000.0}}
         with tempfile.TemporaryDirectory() as tmp:
             r = goodput.compute(write_run(Path(tmp), [record(11), line(20, parse.MSG_BOOMER_QUIT)],
-                                          {"start_ts": T0, "end_ts": T0 + 30}),
-                                dict(CONFIG, baselines=[base]))
-        self.assertEqual(r["modes"]["strict"]["g3_basis"], "wall")
-        self.assertEqual(r["modes"]["strict"]["whole"]["bad_reasons"], {"slow": 1})  # 8000 / 4000 > 1.5
-        self.assertEqual(r["modes"]["relaxed"]["whole"]["tasks_good"], 1)  # 2.0 <= 2.0
+                                          {"start_ts": T0, "end_ts": T0 + 30}), CONFIG, baseline=baseline)
+        strict, relaxed = r["modes"]["strict"], r["modes"]["relaxed"]
+        self.assertEqual(r["baseline"], baseline)
+        self.assertEqual(strict["checks_skipped"], [])
+        self.assertEqual(strict["whole"]["bad_reasons"], {"slow_wall": 1})  # wall 8000 / 4000 > 1.5; cel 1.0
+        self.assertEqual((strict["whole"]["wall_ms_ratio_p50"], strict["whole"]["cel_ms_ratio_p50"]), (2.0, 1.0))
+        self.assertEqual(relaxed["whole"]["tasks_good"], 1)  # 2.0 <= 2.0
 
     def test_identity_and_runtime(self):
         ident = goodput.identity_from_path(
@@ -396,49 +502,108 @@ class ComputeTest(unittest.TestCase):
             out = Path(tmp) / "out"
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(goodput.main(["compute", str(run), "--out", str(out)]), 0)
-            self.assertEqual(json.loads((out / "goodput.json").read_text())["version"], 1)
+            self.assertEqual(json.loads((out / "goodput.json").read_text())["version"], 2)
             self.assertEqual(len((out / "goodput.jsonl").read_text().splitlines()), 2)
+
+    def test_cli_baseline_file_and_baseline_run_agree(self):
+        meta = {"start_ts": T0, "end_ts": T0 + 20}
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            run = write_run(d / "run", [record(11, A), record(12, B, wall_ms=6500.0)], meta)
+            one_user = write_run(d / "one_user", [record(11, wall_ms=4000.0, cel_ms=6000.0)], meta)
+            with contextlib.redirect_stdout(io.StringIO()) as printed:
+                self.assertEqual(goodput.main(["baseline", str(one_user)]), 0)
+            (d / "base.json").write_text(printed.getvalue(), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(goodput.main(["compute", str(run), "--out", str(d / "a"),
+                                               "--baseline-run", str(one_user)]), 0)
+                self.assertEqual(goodput.main(["compute", str(run), "--out", str(d / "b"),
+                                               "--baseline", str(d / "base.json")]), 0)
+            a, b = (json.loads((d / x / "goodput.json").read_text()) for x in ("a", "b"))
+        self.assertEqual((a["baseline"]["source"], b["baseline"]["source"]),
+                         (f"run:{one_user}", f"file:{d / 'base.json'}"))
+        self.assertEqual(a["baseline"]["refs"], b["baseline"]["refs"])
+        self.assertEqual((a["modes"], a["tasks"]), (b["modes"], b["tasks"]))
+        self.assertEqual([t["reasons_by_mode"]["strict"] for t in a["tasks"]], [["slow_wall"], ["slow_wall"]])
+        self.assertEqual([t["status_by_mode"]["relaxed"] for t in a["tasks"]], ["good", "good"])
+
+    def test_cli_baseline_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp) / "run", [record(11)], {})
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as exit_:
+                goodput.main(["compute", str(run), "--baseline", "b.json", "--baseline-run", str(run)])
+            self.assertEqual(exit_.exception.code, 2)
+            self.assertIn("not allowed with", err.getvalue())
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(goodput.main(["compute", str(run), "--baseline", str(Path(tmp) / "missing.json")]), 1)
+            self.assertIn("baseline:", err.getvalue())
 
 
 class BaselineTest(unittest.TestCase):
-    def run_baseline(self, runs: list[Path], *extra: str) -> tuple[int, str, str]:
+    def run_baseline(self, runs: list[Path]) -> tuple[int, str, str]:
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = goodput.main(["baseline", *map(str, runs), *extra])
+            rc = goodput.main(["baseline", *map(str, runs)])
         return rc, out.getvalue(), err.getvalue()
 
-    def test_entry_from_two_runs(self):
-        def task_cel(median_ms: str, count: str) -> list[dict]:
-            return [{"timestamp": "", "tag": "abc", "test_name": "sweperf_test", "metric": "actor_TaskCEL",
-                     "measurements": {"median_response_time": median_ms, "request_count": count}}]
+    def test_refs_pool_the_clean_tasks_of_all_runs(self):
         meta = {"start_ts": T0, "end_ts": T0 + 100}
         failed = record(40, C, failed=True, fail_step="resume", fail_cycle=2, wall_ms=30000.0)
+        task_cel = [{"timestamp": "", "tag": "abc", "test_name": "sweperf_test", "metric": "actor_TaskCEL",
+                     "measurements": {"median_response_time": "9999", "request_count": "4"}}]
         with tempfile.TemporaryDirectory() as tmp:
-            a = write_run(Path(tmp) / "a", [record(11, A), record(23, B), failed], meta, stats=task_cel("6000", "1"))
-            b = write_run(Path(tmp) / "b", [record(11, A)], meta, stats=task_cel("9000", "3"))
+            a = write_run(Path(tmp) / "a", [record(11, A), record(23, B, wall_ms=10000.0, ttfe_max_ms=None), failed],
+                          meta, stats=task_cel)
+            b = write_run(Path(tmp) / "b", [record(11, A, wall_ms=12000.0, startup_ms=None)], meta)
             rc, out, _ = self.run_baseline([a, b])
         self.assertEqual(rc, 0)
-        # 3 clean tasks of 8000 ms; the failed task is left out
-        self.assertEqual(json.loads(out), {"runs": 2, "tasks": 3, "runtime": "gvisor", "machine_type": "c3-highcpu-88",
-                                           "template": "sweperf-astropy-7336", "wall_ref_ms": 8000.0,
-                                           "task_cel_ref_ms": 8250.0})  # (6000*1 + 9000*3) / 4
+        j = json.loads(out)
+        self.assertEqual((j["version"], j["runs"], j["tasks"], j["sources"]), (1, 2, 3, [str(a), str(b)]))
+        refs = j["refs"]
+        self.assertEqual(set(refs), set(classify.CHECK_FIELDS))
+        self.assertEqual(refs["wall_ms"], 10000.0)  # median of 8000, 10000, 12000; the failed task is left out
+        self.assertEqual(refs["cel_ms"], 6000.0)  # from the records, not actor_TaskCEL
+        self.assertEqual((refs["ttfe_max_ms"], refs["startup_ms"]), (210.0, 600.0))  # tasks without it skipped
+        self.assertEqual(refs["retries"], 0.0)
 
-    def test_runs_that_disagree(self):
+    def test_a_field_no_task_logged_is_left_out(self):
         with tempfile.TemporaryDirectory() as tmp:
-            a = write_run(Path(tmp) / "a", [record(11)], {})
-            b = write_run(Path(tmp) / "b", [record(11)], {}, trial={"machine_type": "other"})
-            rc, _, err = self.run_baseline([a, b])
-            self.assertEqual(rc, 1)
-            self.assertIn("machine_type", err)
-            rc, out, _ = self.run_baseline([a, b], "--machine-type", "c3-highcpu-88")
-            self.assertEqual((rc, json.loads(out)["machine_type"]), (0, "c3-highcpu-88"))
+            refs, n = goodput.baseline_refs([write_run(Path(tmp), [record(11, think_ms=None)], {})])
+        self.assertEqual(n, 1)
+        self.assertNotIn("think_ms", refs)
 
-    def test_no_clean_tasks(self):
+    def test_tasks_are_built_like_compute(self):
+        logs = [record(11, A), line(20, parse.MSG_SHUTDOWN), record(20.5, B, wall_ms=9000.0),
+                line(25, parse.MSG_RESUME_FAIL, C, cycle=1)]
+        with tempfile.TemporaryDirectory() as tmp:
+            run = write_run(Path(tmp), logs, {})
+            refs, n = goodput.baseline_refs([run])
+            totals = goodput.compute(run, CONFIG)["totals"]
+        self.assertEqual((n, totals["tasks_finished"], totals["tasks_unfinished_bad"]), (2, 2, 0))
+        self.assertEqual(refs["wall_ms"], 8500.0)
+
+    def test_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             a = write_run(Path(tmp) / "a", [record(11, failed=True, fail_step="execute", fail_cycle=1)], {})
-            rc, _, err = self.run_baseline([a])
-        self.assertEqual(rc, 1)
-        self.assertIn("no finished task", err)
+            no_clean, missing = self.run_baseline([a]), self.run_baseline([Path(tmp) / "missing"])
+        self.assertIn("no finished task", no_clean[2])
+        for rc, _, err in (no_clean, missing):
+            self.assertEqual(rc, 1)
+            self.assertTrue(err.startswith("baseline: ") and err.count("\n") == 1, err)
+
+    def test_load_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "base.json"
+            path.write_text(json.dumps({"version": 1, "refs": {"cel_ms": 5000, "wall_ms": 9000.5}}), encoding="utf-8")
+            self.assertEqual(goodput.load_baseline(path),
+                             {"source": f"file:{path}", "refs": {"cel_ms": 5000, "wall_ms": 9000.5}})
+            for bad in ({"version": 2, "refs": {}}, {"version": 1}, {"version": 1, "refs": {"fail_cycle": 1}},
+                        {"version": 1, "refs": {"cel_ms": True}}, {"version": 1, "refs": {"cel_ms": "5"}}, []):
+                path.write_text(json.dumps(bad), encoding="utf-8")
+                with self.assertRaises(ValueError, msg=bad):
+                    goodput.load_baseline(path)
 
 
 if __name__ == "__main__":
