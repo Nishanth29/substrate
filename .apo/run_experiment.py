@@ -4,9 +4,11 @@
 Run through .apo/run_experiment.sh, which sources .apo/set-env.sh first.
 
 One trial (--mode fixed, the default; what APO runs):
-  1. Installs the trial's Substrate build (hack/install-ate.sh) and recreates
-     the sweperf template with benchmarking/workloads/deploy.sh, so its golden
-     snapshot comes from this build.
+  1. Installs the trial's Substrate build (hack/install-ate.sh, a shim for
+     `go run ./cmd/ate-setup`: deploy atelet, apiserver, atenet), deploys the
+     benchmark WorkerPool with benchmarking/workloads/deploy.sh and recreates
+     the sweperf template from manifests/sweperf-template.yaml.tmpl, so its
+     golden snapshot comes from this build.
   2. Applies node knobs (tmpfs for the actor directory, neighbour-table
      sysctls) through a privileged node shell, and object-storage env knobs.
   3. Purges every simulated actor, then runs agentsim (substrate-agents-tco,
@@ -63,7 +65,13 @@ TUNABLES = os.path.join(MANIFESTS, "tunables.env")
 
 SIM_ATESPACE = "agents-sim"
 RESULT_PREFIX = "AGENTSIM_RESULT_JSON "
-POOL = ("-n", "benchmark-workloads", "workerpool", "benchmark-ateom")
+# benchmarking/workloads/deploy.sh's WorkerPool (was benchmark-ateom before the
+# ateom -> ateworker rename); atecontroller names its Deployment after it and
+# labels its pods ate.dev/worker-pool=<name>.
+WORKER_POOL = "benchmark-worker"
+POOL = ("-n", "benchmark-workloads", "workerpool", WORKER_POOL)
+POOL_PODS = f"ate.dev/worker-pool={WORKER_POOL}"
+POOL_DEPLOYMENT = f"deployment/{WORKER_POOL}"
 # Pod states that mean the agentsim pod will never start on its own.
 START_FAIL_REASONS = ("ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError")
 PENDING_LIMIT_S = 600
@@ -138,11 +146,18 @@ def check_context(env: Dict[str, str]) -> Optional[str]:
 SANDBOX_CONFIG_NAMES = {"gvisor": "gvisor-default", "microvm": "microvm"}
 
 
-def sandboxconfig_problem(cfg: Optional[dict], name: str) -> Optional[str]:
-  """Returns why SandboxConfig cfg can't serve actors, or None if it can."""
+def sandboxconfig_problem(cfg: Optional[dict], name: str,
+                          asset_bucket: str = "") -> Optional[str]:
+  """Returns why SandboxConfig cfg can't serve actors, or None if it can.
+
+  asset_bucket: for microvm, the bucket every asset URL must name. On GKE the
+  micro-VM assets live in <BUCKET_NAME>-assets (upstream #3037), which atelet
+  may read; a config still pointing at the snapshot bucket breaks once nodes
+  lose access to it.
+  """
   if cfg is None:
-    return (f"SandboxConfig {name} not found (gvisor-default: install-ate.sh "
-            "--deploy-ate-system; microvm: hack/install-microvm-deps.sh --install)")
+    return (f"SandboxConfig {name} not found (gvisor-default: ate-setup deploy "
+            "ate-system; microvm: hack/install-microvm-deps.sh --install)")
   spec = cfg.get("spec") or {}
   default = spec.get("defaultVersion")
   if not default:
@@ -151,6 +166,13 @@ def sandboxconfig_problem(cfg: Optional[dict], name: str) -> Optional[str]:
     if v.get("name") == default:
       if v.get("state") != "Enabled":
         return f"SandboxConfig {name} default version {default} is {v.get('state')}"
+      if asset_bucket:
+        urls = [a.get("url", "") for arch in (v.get("assets") or {}).values()
+                for a in (arch or {}).values() if isinstance(a, dict)]
+        bad = [u for u in urls if f"://{asset_bucket}/" not in u]
+        if not urls or bad:
+          return (f"SandboxConfig {name} {default} assets are not in gs://{asset_bucket} "
+                  f"({bad[:1] or 'no asset URLs'}); rerun hack/install-microvm-deps.sh --install")
       return None
   return f"SandboxConfig {name} has no version named {default}"
 
@@ -163,8 +185,10 @@ def check_sandboxconfig(env: Dict[str, str]) -> Optional[str]:
     if "NotFound" in (got.stderr or ""):
       return sandboxconfig_problem(None, name)
     return f"could not read SandboxConfig {name}: {(got.stderr or '').strip()[:300]}"
+  asset_bucket = (f"{env['BUCKET_NAME']}-assets"
+                  if env.get("SANDBOX_CLASS") == "microvm" and env.get("BUCKET_NAME") else "")
   try:
-    return sandboxconfig_problem(json.loads(got.stdout), name)
+    return sandboxconfig_problem(json.loads(got.stdout), name, asset_bucket)
   except ValueError:
     return f"could not parse SandboxConfig {name}"
 
@@ -196,18 +220,20 @@ def pin_workers(env: Dict[str, str]) -> bool:
             json.dumps({"spec": {"replicas": 0, "sandboxClasses": classes,
                                  "template": patch}}))
     kubectl(env, "-n", "benchmark-workloads", "wait", "--for=delete", "pod",
-            "-l", "ate.dev/worker-pool=benchmark-ateom", "--timeout=10m")
+            "-l", POOL_PODS, "--timeout=10m")
   spec = {"replicas": int(env["WORKER_COUNT"]), "sandboxClasses": classes, "template": patch}
   kubectl(env, "patch", *POOL, "--type=merge", "-p", json.dumps({"spec": spec}))
   return True
 
 
 TEMPLATE_ATESPACE = "benchmark-workloads"
-GOLDEN_ATESPACE = "ate-golden"  # golden actors: name = the template's UID
+# Golden actors live in the template's atespace, named by the template's UID
+# (upstream #2543; they were in ate-golden before).
+GOLDEN_ATESPACE = TEMPLATE_ATESPACE
 
 
 class TemplateError(Exception):
-  """The old sweperf template can't be removed before deploy.sh recreates it."""
+  """The sweperf template can't be removed or recreated (or its golden failed)."""
 
 
 def kubectl_ate(env: Dict[str, str], *args: str):
@@ -270,29 +296,98 @@ def remove_template(env: Dict[str, str], name: str) -> None:
                       + "; ".join(errors))
 
 
+# Substrate components each trial rebuilds and rolls (ate-setup subcommands;
+# hack/install-ate.sh is now a shim for `go run ./cmd/ate-setup`). The worker
+# image is built by deploy.sh's ko apply of the WorkerPool.
+INSTALL_COMPONENTS = ("atelet", "apiserver", "atenet")
+TEMPLATE_MANIFEST = os.path.join(MANIFESTS, "sweperf-template.yaml.tmpl")
+GOLDEN_TIMEOUT_S = 1200
+
+
+def cpu_millicores(q: str) -> int:
+  """A Kubernetes cpu quantity (250m, 1, 1.5) in millicores, as deploy.sh converts it."""
+  m = re.fullmatch(r"(\d+)m", q.strip())
+  if m:
+    return int(m.group(1))
+  m = re.fullmatch(r"(\d+)(?:\.(\d{1,3}))?", q.strip())
+  if not m:
+    raise ValueError(f"ACTOR_CPU {q!r} is not a cpu quantity like 250m or 1.5")
+  return int(m.group(1)) * 1000 + int((m.group(2) or "").ljust(3, "0"))
+
+
+def memory_bytes(q: str) -> int:
+  """A memory quantity (256Mi, 2Gi) in bytes, as deploy.sh converts it."""
+  m = re.fullmatch(r"(\d+)(Ki|Mi|Gi|Ti)?", q.strip())
+  if not m:
+    raise ValueError(f"ACTOR_MEMORY {q!r} is not a memory quantity like 256Mi or 2Gi")
+  return int(m.group(1)) << {None: 0, "Ki": 10, "Mi": 20, "Gi": 30, "Ti": 40}[m.group(2)]
+
+
+def render_template(env: Dict[str, str]) -> str:
+  return render(TEMPLATE_MANIFEST, dict(
+      env, ACTOR_CPU_MILLICORES=str(cpu_millicores(env.get("ACTOR_CPU", "1"))),
+      ACTOR_MEMORY_BYTES=str(memory_bytes(env["ACTOR_MEMORY"]))))
+
+
+def create_template(env: Dict[str, str]) -> None:
+  """Creates the sweperf template and waits for its golden snapshot (as deploy.sh does)."""
+  name = env["TEMPLATE"]
+  got = run([env["KUBECTL_ATE_BIN"], "--context", env["KUBECTL_CONTEXT"], "create",
+             "actor-template", "-f", "-"], env, check=False, capture_output=True, text=True,
+            input=render_template(env))
+  if got.returncode != 0:
+    raise TemplateError(f"create actor-template {name}: "
+                        f"{(got.stderr or got.stdout or '').strip()[:400]}")
+  deadline = time.time() + GOLDEN_TIMEOUT_S
+  while time.time() < deadline:
+    g = kubectl_ate(env, "get", "actor-template", name, "-a", TEMPLATE_ATESPACE, "-o", "json")
+    if g.returncode == 0:
+      try:
+        golden = (json.loads(g.stdout).get("status") or {}).get("goldenSnapshotStatus") or {}
+      except ValueError:
+        golden = {}
+      if (golden.get("goldenTag") or {}).get("name"):
+        log(f"template {TEMPLATE_ATESPACE}/{name} golden snapshot ready")
+        return
+      if golden.get("errorMessage"):
+        raise TemplateError(f"template {TEMPLATE_ATESPACE}/{name} golden failed: "
+                            f"{golden['errorMessage'][:400]}")
+    time.sleep(5)
+  raise TemplateError(f"no golden snapshot for {TEMPLATE_ATESPACE}/{name} "
+                      f"after {GOLDEN_TIMEOUT_S}s")
+
+
+def install(env: Dict[str, str]) -> None:
+  install_flags = shlex.split(env.get("INSTALL_FLAGS", ""))
+  for component in INSTALL_COMPONENTS:
+    run(["./hack/install-ate.sh", *install_flags, "deploy", component], env)
+
+
 def deploy(env: Dict[str, str]) -> None:
   """Installs the trial build and recreates the sweperf template (new golden)."""
-  install_flags = shlex.split(env.get("INSTALL_FLAGS", ""))
-  run(["./hack/install-ate.sh", *install_flags,
-       "--deploy-atelet", "--deploy-ate-apiserver", "--deploy-atenet"], env)
+  install(env)
   build_kubectl_ate(env)
   remove_template(env, env["TEMPLATE"])
   problem = check_context(env)  # deploy.sh below uses the current context
   if problem:
     raise ContextError(problem)
-  deploy_env = dict(env, WORKLOAD_TEMPLATES=env["TEMPLATE"])
+  # deploy.sh here only applies the WorkerPool (building the worker image) and
+  # creates the atespace: a blank WORKLOAD_TEMPLATES selects no template, since
+  # the harness creates the sweperf one itself (create_template).
+  deploy_env = dict(env, WORKLOAD_TEMPLATES=" ")
   deploy_cmd = ["./benchmarking/workloads/deploy.sh", "--deploy",
                 f"--worker-count={env['WORKER_COUNT']}",
                 f"--sandbox-class={env['SANDBOX_CLASS']}",
-                f"--actor-memory={env['ACTOR_MEMORY']}"]
+                "--wait-timeout=1200"]
   # Pin first so the golden is taken on the metal node (a snapshot from another
   # CPU family won't restore). ko apply is client-side, so the pin survives.
   pinned = pin_workers(env)
   run(deploy_cmd, env=deploy_env)
-  if not pinned and pin_workers(env):
-    run(deploy_cmd, env=deploy_env)  # first deploy: redo the template on the pinned pool
+  if not pinned:
+    pin_workers(env)  # first deploy: the pool exists only now
   kubectl(env, "-n", "benchmark-workloads", "rollout", "status",
-          "deployment/benchmark-ateom", "--timeout=20m")
+          POOL_DEPLOYMENT, "--timeout=20m")
+  create_template(env)
 
 
 # --- Node and object-storage knobs --------------------------------------------
@@ -347,7 +442,9 @@ def apply_node_knobs(env: Dict[str, str]) -> Dict[str, str]:
 # from this file. Rewritten on every trial (empty when APO_FLAGS is unset) while the workers
 # are at zero, so a lever's flag can never leak into a v000 trial.
 APO_FLAGS_FILE = "/var/lib/ate/apo-flags.env"
-APO_SWITCHES_MSG = "APO lever switches"  # logged once by a lever build's ateom at startup
+APO_SWITCHES_MSG = "APO lever switches"  # logged once by a lever build's ateworker at startup
+# ateworker-microvm's per-restore record (restore.go), slog durations in ns.
+RESTORE_PHASES_MSG = "Actor restore phases"
 APO_EVENT_PREFIX = "APO "  # a lever's own records, e.g. "APO reseed answered"
 APO_FLAG_RE = re.compile(r"ATE_APO_[A-Z0-9_]+=[A-Za-z0-9._-]*")
 
@@ -411,10 +508,10 @@ def scale_workers(env: Dict[str, str], n: int) -> None:
   kubectl(env, "patch", *POOL, "--type=merge", "-p", json.dumps({"spec": {"replicas": n}}))
   if n == 0:
     kubectl(env, "-n", "benchmark-workloads", "wait", "--for=delete", "pod",
-            "-l", "ate.dev/worker-pool=benchmark-ateom", "--timeout=15m")
+            "-l", POOL_PODS, "--timeout=15m")
   else:
     kubectl(env, "-n", "benchmark-workloads", "rollout", "status",
-            "deployment/benchmark-ateom", "--timeout=20m")
+            POOL_DEPLOYMENT, "--timeout=20m")
 
 
 # Workers register with ate-api-server after their pod is Ready; a ramp that starts before
@@ -516,8 +613,13 @@ def agentsim_args(env: Dict[str, str], mode: str, prefix: str) -> List[str]:
       f"--fail-error-pct={env['FAIL_ERROR_PCT']}",
       f"--fail-refusal-pct={env['FAIL_REFUSAL_PCT']}",
       f"--fail-crashed={env['FAIL_CRASHED']}",
-      "--lifecycle-mode=suspend",
+      # Explicit, locked: SuspendActor with no suspend_options, which upstream
+      # now completes asynchronously (#2805; recorded in summary metadata).
+      f"--lifecycle-mode={env.get('LIFECYCLE_MODE', 'suspend')}",
       "--suspender-url=",
+      # The router only serves mTLS on 443 now (#2977); agentsim presents its
+      # podidentity cert (AGENTSIM_SPIFFE_ID must be in the router allowlist).
+      f"--router-url={env.get('ROUTER_URL', 'https://atenet-router.ate-system.svc:443')}",
       "--result-json=-",
   ]
   if mode == "ramp":
@@ -684,6 +786,8 @@ class TrialLogs:
   worker pod seen -> IP and node, to map Envoy's upstream address to a worker.
   apo_switches.jsonl: each worker's startup "APO lever switches" record (the ATE_APO_* switches
   that were on), with k8s.pod. apo_events.jsonl: a lever's own "APO ..." records, with k8s.pod.
+  restore_phases.jsonl: ateworker-microvm's "Actor restore phases" records (slog durations in
+  ns, including reseed = agent dial + CRNG reseed RPC), with k8s.pod.
 
   poll() reads every container from where its last poll ended (--since-time has one-second
   resolution, so lines are deduplicated by their kubelet timestamp); start() polls every
@@ -691,7 +795,7 @@ class TrialLogs:
   """
 
   FILES = ("breakdown.jsonl", "warn.jsonl", "router.log", "envoy_access.log", "apo_switches.jsonl",
-           "apo_events.jsonl")
+           "apo_events.jsonl", "restore_phases.jsonl")
 
   def __init__(self, env: Dict[str, str], since: str, out_dir: str):
     self.env, self.since, self.out_dir = env, since, out_dir
@@ -730,7 +834,7 @@ class TrialLogs:
 
   def poll(self) -> None:
     with self.mu:
-      for ns, sel in (("ate-system", None), ("benchmark-workloads", "ate.dev/worker-pool=benchmark-ateom")):
+      for ns, sel in (("ate-system", None), ("benchmark-workloads", POOL_PODS)):
         got = kubectl(self.env, "-n", ns, "get", "pods", "-o", "json", *(["-l", sel] if sel else []),
                       capture_output=True, text=True, check=False, quiet=True)
         try:
@@ -780,6 +884,8 @@ class TrialLogs:
     tagged = json.dumps(dict(rec, **{"k8s.pod": pod})) + "\n"
     if "timing breakdown" in line:
       self.out["breakdown.jsonl"].write(tagged)
+    elif rec.get("msg") == RESTORE_PHASES_MSG:
+      self.out["restore_phases.jsonl"].write(tagged)
     elif rec.get("msg") == APO_SWITCHES_MSG:
       self.out["apo_switches.jsonl"].write(tagged)
     elif str(rec.get("msg", "")).startswith(APO_EVENT_PREFIX):
@@ -799,9 +905,37 @@ def collect_breakdown(env: Dict[str, str], since: str, out_dir: str,
   return (logs or TrialLogs(env, since, out_dir)).finish()
 
 
+def breakdown_stage(key: str) -> Optional[str]:
+  """Stage name of a breakdown duration key, or None.
+
+  atelet: ate.actor.restore.duration.download -> restore_download. Worker
+  (ateworker.actor.restore.duration.vm_restore; ateom.* before the rename) ->
+  restore_vm_restore, except its total -> restore_worker_total, so it doesn't
+  merge with atelet's total.
+  """
+  if ".duration." not in key or ".actor." not in key:
+    return None
+  stage = key.split(".actor.", 1)[-1].replace(".duration.", "_")
+  if key.startswith(("ateworker.", "ateom.")) and stage.endswith("_total"):
+    stage = stage[:-len("_total")] + "_worker_total"
+  return stage
+
+
+def pctl(vals: List[float], q: float) -> float:
+  vals = sorted(vals)
+  return round(vals[min(len(vals) - 1, int(len(vals) * q))], 1)
+
+
 def summarize_breakdown(path: str) -> Dict[str, float]:
-  """p50/p90 ms per stage of the simulated actors' restore and checkpoint lines."""
+  """p50/p90 ms per stage of the simulated actors' restore and checkpoint lines.
+
+  atelet's restore records carry ate.snapshot.kind (local = the node-local copy a
+  resume on the same node restores from, latest = the durable snapshot downloaded
+  from the bucket, boot = cold start); restores are also counted per kind, with
+  their download / manifest_fetch / total p50/p90.
+  """
   stages: Dict[str, List[float]] = {}
+  by_kind: Dict[str, Dict[str, List[float]]] = {}
   if not os.path.exists(path):
     return {}
   with open(path, encoding="utf-8") as f:
@@ -812,15 +946,27 @@ def summarize_breakdown(path: str) -> Dict[str, float]:
         continue
       if rec.get("ate.atespace") != SIM_ATESPACE:
         continue
+      kind = rec.get("ate.snapshot.kind") if "Restore" in str(rec.get("msg", "")) else None
       for k, v in rec.items():
-        if ".duration." in k and isinstance(v, (int, float)):
-          stage = k.split(".actor.", 1)[-1].replace(".duration.", "_")
-          stages.setdefault(stage, []).append(v * 1000)
+        stage = breakdown_stage(k) if isinstance(v, (int, float)) else None
+        if not stage:
+          continue
+        stages.setdefault(stage, []).append(v * 1000)
+        if kind and k.startswith("ate.actor.restore.duration."):
+          by_kind.setdefault(kind, {}).setdefault(stage, []).append(v * 1000)
   out: Dict[str, float] = {}
   for stage, vals in sorted(stages.items()):
-    vals.sort()
-    out[f"stage_{stage}_p50_ms"] = round(vals[len(vals) // 2], 1)
-    out[f"stage_{stage}_p90_ms"] = round(vals[min(len(vals) - 1, int(len(vals) * 0.9))], 1)
+    out[f"stage_{stage}_p50_ms"] = pctl(vals, 0.5)
+    out[f"stage_{stage}_p90_ms"] = pctl(vals, 0.9)
+  for kind, kstages in sorted(by_kind.items()):
+    out[f"restores_kind_{kind}"] = len(kstages.get("restore_total") or [])
+    for stage in ("restore_download", "restore_manifest_fetch", "restore_total"):
+      if kstages.get(stage):
+        out[f"stage_{stage}_{kind}_p50_ms"] = pctl(kstages[stage], 0.5)
+        out[f"stage_{stage}_{kind}_p90_ms"] = pctl(kstages[stage], 0.9)
+  total = sum(v for k, v in out.items() if k.startswith("restores_kind_"))
+  if total:
+    out["restore_local_pct"] = round(100 * out.get("restores_kind_local", 0) / total, 1)
   return out
 
 
@@ -828,7 +974,14 @@ def summarize_breakdown(path: str) -> Dict[str, float]:
 # stall: past the router's 5 s park budget, on its way to the 10 s ext_proc timeout.
 STALL_S = 5.0
 BURST_GAP_S = 30.0  # stalls closer than this belong to one burst
-RESEED_RETRY_MSG = "guest CRNG reseed failed; retrying"
+# Parts of wakeup_probe in the breakdown record of a build with the Phase 4 / lever A
+# instrumentation (agent_dial, reseed_rpc = the CRNG reseed RPC alone, probe). Upstream
+# logs only reseed (dial + RPC) in its "Actor restore phases" record (restore_phases.jsonl).
+STALL_PARTS = ("agent_dial", "reseed_rpc", "probe")
+# Upstream's reseed is one 60 s call with no retry (#2743); lever A logs one
+# "APO reseed attempt" record per attempt, so attempt > 1 is a retry.
+RESEED_ATTEMPT_MSG = "APO reseed attempt"
+_WORKER_RESTORE_KEYS = ("ateworker.actor.restore.duration.", "ateom.actor.restore.duration.")
 
 
 def rfc3339_epoch(ts: str) -> Optional[float]:
@@ -839,36 +992,52 @@ def rfc3339_epoch(ts: str) -> Optional[float]:
   return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")) + float(m.group(2) or 0)
 
 
-def summarize_stalls(out_dir: str) -> Tuple[Dict[str, float], Dict]:
-  """Stalled restores of the simulated actors: how many, which part of wakeup_probe, which workers.
-
-  Reads breakdown.jsonl (the ateom-microvm restore records carry wakeup_probe and, from the
-  Phase 4 instrumentation on, its parts agent_dial, reseed and probe) and warn.jsonl (reseed
-  retries). Returns (metrics, detail): detail goes to stalls.json, per worker and per burst.
-  """
-  key = "ateom.actor.restore.duration."
-  restores, stalls, split = 0, [], False
-  path = os.path.join(out_dir, "breakdown.jsonl")
+def read_jsonl(path: str) -> List[dict]:
+  out: List[dict] = []
   if os.path.exists(path):
     with open(path, encoding="utf-8") as f:
       for line in f:
         rec = json_record(line)
-        if not rec or rec.get("ate.atespace") != SIM_ATESPACE or (key + "wakeup_probe") not in rec:
-          continue
-        restores += 1
-        split |= (key + "reseed") in rec
-        if rec[key + "wakeup_probe"] >= STALL_S:
-          stalls.append({"t": rfc3339_epoch(rec.get("time", "")), "pod": rec.get("k8s.pod", ""),
-                         "wakeup_probe_s": rec[key + "wakeup_probe"],
-                         **{p + "_s": rec.get(key + p) for p in ("agent_dial", "reseed", "probe")}})
+        if rec:
+          out.append(rec)
+  return out
+
+
+def summarize_stalls(out_dir: str) -> Tuple[Dict[str, float], Dict]:
+  """Stalled restores of the simulated actors: how many, which part of wakeup_probe, which workers.
+
+  Reads breakdown.jsonl (the ateworker-microvm restore records carry wakeup_probe and, on an
+  instrumented build, its parts STALL_PARTS), restore_phases.jsonl (upstream's reseed time,
+  used when the breakdown has no parts) and apo_events.jsonl (lever A reseed attempts).
+  Returns (metrics, detail): detail goes to stalls.json, per worker and per burst.
+  """
+  restores, stalls, split = 0, [], False
+  sim_uids = set()
+  for rec in read_jsonl(os.path.join(out_dir, "breakdown.jsonl")):
+    key = next((p for p in _WORKER_RESTORE_KEYS if (p + "wakeup_probe") in rec), None)
+    if rec.get("ate.atespace") != SIM_ATESPACE or not key:
+      continue
+    restores += 1
+    sim_uids.add(rec.get("ate.actor.uid", ""))
+    split |= any((key + p) in rec for p in STALL_PARTS)
+    if rec[key + "wakeup_probe"] >= STALL_S:
+      stalls.append({"t": rfc3339_epoch(rec.get("time", "")), "pod": rec.get("k8s.pod", ""),
+                     "uid": rec.get("ate.actor.uid", ""),
+                     "wakeup_probe_s": rec[key + "wakeup_probe"],
+                     **{p + "_s": rec.get(key + p) for p in STALL_PARTS}})
+  # Upstream's "Actor restore phases": durations in ns, reseed = agent dial + reseed RPC.
+  phase_stalls = []
+  for rec in read_jsonl(os.path.join(out_dir, "restore_phases.jsonl")):
+    if rec.get("id") not in sim_uids or not isinstance(rec.get("wakeup_probe"), (int, float)):
+      continue
+    if rec["wakeup_probe"] / 1e9 >= STALL_S:
+      phase_stalls.append({"pod": rec.get("k8s.pod", ""), "uid": rec.get("id"),
+                           "wakeup_probe_s": rec["wakeup_probe"] / 1e9,
+                           "reseed_s": (rec.get("reseed") or 0) / 1e9})
   retries: Dict[str, int] = {}
-  wpath = os.path.join(out_dir, "warn.jsonl")
-  if os.path.exists(wpath):
-    with open(wpath, encoding="utf-8") as f:
-      for line in f:
-        rec = json_record(line)
-        if rec and rec.get("msg") == RESEED_RETRY_MSG:
-          retries[rec.get("k8s.pod", "")] = retries.get(rec.get("k8s.pod", ""), 0) + 1
+  for rec in read_jsonl(os.path.join(out_dir, "apo_events.jsonl")):
+    if rec.get("msg") == RESEED_ATTEMPT_MSG and int(rec.get("attempt") or 1) > 1:
+      retries[rec.get("k8s.pod", "")] = retries.get(rec.get("k8s.pod", ""), 0) + 1
   if not restores and not retries:
     return {}, {}
   timed = sorted((s for s in stalls if s["t"] is not None), key=lambda s: s["t"])
@@ -883,17 +1052,21 @@ def summarize_stalls(out_dir: str) -> Tuple[Dict[str, float], Dict]:
   per_pod: Dict[str, int] = {}
   for s in stalls:
     per_pod[s["pod"]] = per_pod.get(s["pod"], 0) + 1
-  def part(name: str) -> int:  # stalls whose time went mostly into one part of wakeup_probe
-    return sum(1 for s in stalls if s.get(name + "_s") is not None
+  def part(name: str, items: List[Dict]) -> int:  # stalls mostly in one part of wakeup_probe
+    return sum(1 for s in items if s.get(name + "_s") is not None
                and s[name + "_s"] >= 0.5 * s["wakeup_probe_s"])
   m = {"restore_records": restores, "restore_stalls": len(stalls),
        "restore_stall_bursts": len(bursts), "restore_stall_pods": len(per_pod),
        "reseed_retries": sum(retries.values())}
-  if split:  # records from before the instrumentation have wakeup_probe only
-    m.update(restore_stalls_in_reseed=part("reseed"), restore_stalls_in_probe=part("probe"),
-             restore_stalls_in_agent_dial=part("agent_dial"))
+  if split:  # an instrumented build: the parts are in the breakdown record
+    m.update(restore_stalls_in_reseed=part("reseed_rpc", stalls),
+             restore_stalls_in_probe=part("probe", stalls),
+             restore_stalls_in_agent_dial=part("agent_dial", stalls))
+  elif phase_stalls:  # upstream: reseed (dial + RPC) from the restore-phases record
+    m.update(restore_stalls_in_reseed=part("reseed", phase_stalls))
   detail = {"stall_s": STALL_S, "burst_gap_s": BURST_GAP_S, "per_pod": per_pod,
-            "reseed_retries_per_pod": retries, "bursts": bursts, "stalls": stalls}
+            "reseed_retries_per_pod": retries, "bursts": bursts, "stalls": stalls,
+            "phase_stalls": phase_stalls}
   return m, detail
 
 
@@ -930,7 +1103,9 @@ def write_monitor(results_dir: str, breakdown: Dict[str, float], metrics: Dict) 
             "ttfe_accept_p95_ms", "ceiling_per_s", "spec_ceiling_per_s", "fine_ceiling_per_s",
             "fine_spec_ceiling_per_s", "restore_stalls", "restore_stall_bursts",
             "restore_stalls_in_reseed", "restore_stalls_in_probe", "reseed_retries",
-            "refusals_status_503", "refusals_status_504"):
+            "refusals_status_503", "refusals_status_504", "restore_local_pct",
+            "restores_kind_local", "restores_kind_latest", "stage_restore_download_p50_ms",
+            "stage_restore_download_p90_ms", "stage_restore_manifest_fetch_p50_ms"):
     if k in metrics:
       lines.append(f"- `{k}`: {metrics[k]}")
   with open(os.path.join(mon, "README.md"), "w", encoding="utf-8") as f:
@@ -960,8 +1135,8 @@ def node_oom_lines(env: Dict[str, str], since_epoch: int, until_epoch: int = 0) 
 # OOM kills that count: Substrate and its actors. Kernel task names are cut at 15 chars
 # (cloud-hyperviso). Sandboxed workload processes (sweperf etc.) are matched by their actor
 # cgroup (task_memcg), same leaves as the leak check.
-_ATE_OOM_TASK_RE = re.compile(r"^(runsc.*|cloud-hyperviso.*|virtiofsd.*|kata.*|ateom.*|atelet.*|"
-                              r"snapshot-plugi.*|agentsim.*|sweperf.*)$")
+_ATE_OOM_TASK_RE = re.compile(r"^(runsc.*|cloud-hyperviso.*|virtiofsd.*|kata.*|ateworker.*|ateom.*|"
+                              r"atelet.*|objectstore-plu.*|snapshot-plugi.*|agentsim.*|sweperf.*)$")
 
 
 def classify_oom(text: str) -> Dict:
@@ -986,10 +1161,11 @@ def classify_oom(text: str) -> Dict:
 # trial (after the node knobs) and after the end-of-trial cleanup. Runs in the
 # host's mount and net namespaces, so it uses the host's tools and /proc.
 
-# Actor cgroup leaves: gVisor <actorUID>-<container> and the ateom leaf
-# (internal/ocispec, internal/ateomcgroup), microVM /ateomchv/<cid> (kata).
+# Actor cgroup leaves under a worker pod's cgroup (internal/ateworker/cgroup, internal/ocispec):
+# <actorUID> or gVisor's <actorUID>-<container>, and the worker's own "worker" leaf (was
+# "ateom"/"ateomchv" before the rename). Anchored under kubepods so no system cgroup matches.
 _UUID = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-_ATE_CGROUP_RE = f".*/(ateom|ateomchv|{_UUID}-[^/]*)(/.*)?"
+_ATE_CGROUP_RE = f".*/kubepods[^/]*(/[^/]+)*/(worker|ateom|ateomchv|{_UUID}(-[^/]*)?)(/.*)?"
 _RUNTIME_PROCS = "runsc*|cloud-hypervisor*|virtiofsd*|kata*"
 
 NODE_SNAPSHOT_SH = f"""\
@@ -1000,7 +1176,7 @@ echo cgroups_ate=$(find $cg -mindepth 1 -type d -regextype posix-extended \\
 echo netns=$( {{ for f in /run/netns/*; do [ -e "$f" ] && stat -L -c 'net:[%i]' "$f"; done
   for p in /proc/[0-9]*; do readlink $p/ns/net; done; }} 2>/dev/null | grep '^net:' | sort -u | wc -l)
 echo netns_named=$(ls -A /run/netns 2>/dev/null | wc -l)
-echo netns_actor=$(ls -A /run/netns 2>/dev/null | grep -c '^ateom-actor:')
+echo netns_actor=$(ls -A /run/netns 2>/dev/null | grep -c '^worker-actor:')
 echo netns_lsns=$(lsns -n -t net 2>/dev/null | wc -l)
 lh=$(ip -o link 2>/dev/null | wc -l)
 ln=$(for f in /run/netns/*; do [ -e "$f" ] && ip -n "${{f##*/}}" -o link 2>/dev/null; done | wc -l)
@@ -1013,6 +1189,8 @@ echo mounts=$(grep -cE '^([^ ]+ ){{4}}/var/lib/ate(/| )' /proc/1/mountinfo)
 echo mounts_actors=$(grep -cE '^([^ ]+ ){{4}}/var/lib/ate/actors/' /proc/1/mountinfo)
 echo actor_entries=$(find /var/lib/ate/actors -mindepth 1 2>/dev/null | wc -l)
 echo actor_kb=$( (du -sxk /var/lib/ate/actors 2>/dev/null || echo 0) | cut -f1)
+echo snapshot_dirs=$(find /var/lib/ate/snapshots -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
+echo snapshot_kb=$( (du -sxk /var/lib/ate/snapshots 2>/dev/null || echo 0) | cut -f1)
 n=0
 for p in /proc/[0-9]*; do e=$(readlink $p/exe 2>/dev/null)
   case "${{e##*/}}" in {_RUNTIME_PROCS}) n=$((n + 1));; esac; done
@@ -1030,7 +1208,7 @@ grep -E '^([^ ]+ ){{4}}/var/lib/ate/actors/' /proc/1/mountinfo | cut -d' ' -f5 |
 for p in /proc/[0-9]*; do e=$(readlink $p/exe 2>/dev/null)
   case "${{e##*/}}" in {_RUNTIME_PROCS}) kill -9 "${{p#/proc/}}";; esac; done
 sleep 2
-for f in /run/netns/ateom-actor:*; do [ -e "$f" ] && {{ umount "$f"; rm -f "$f"; }}; done
+for f in /run/netns/worker-actor:*; do [ -e "$f" ] && {{ umount "$f"; rm -f "$f"; }}; done
 find /sys/fs/cgroup -mindepth 1 -depth -type d -regextype posix-extended \\
   -regex '{_ATE_CGROUP_RE}' -exec rmdir {{}} \\;
 for d in /var/lib/ate/actors/*; do [ -e "$d" ] || continue
@@ -1087,11 +1265,12 @@ def leak_metrics(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int
 LAST_SNAPSHOT_RAW = {"text": ""}  # raw NODE_SNAPSHOT_SH output, saved in leak.json
 
 # Node daemons whose memory we watch (context only): name -> metric prefix.
-RSS_PROCS = {"snapshot-plugin": "snapshot_plugin", "atelet": "atelet"}
+# objectstore-plugin was the snapshot-plugin sidecar (renamed upstream #2540).
+RSS_PROCS = {"objectstore-plugin": "objectstore_plugin", "atelet": "atelet"}
 NODE_RSS_SH = """\
 n=0; t=0
 for p in /proc/[0-9]*; do e=$(readlink $p/exe 2>/dev/null); e=${e##*/}
-  case "$e" in snapshot-plugin|atelet)
+  case "$e" in objectstore-plugin|atelet)
     echo "$e $(awk '/^VmRSS:/{print $2}' $p/status 2>/dev/null)" \\
       "$(awk '/^VmHWM:/{print $2}' $p/status 2>/dev/null)";;
   runsc*|cloud-hypervisor*|virtiofsd*)
@@ -1347,8 +1526,9 @@ def provenance_static(env: Dict[str, str], mode: str, trial_id: str) -> Dict:
       "bucket": env.get("BUCKET_NAME", ""),
       "effective": {k: env.get(k) for k in ("RATE", "AWAKE", "REGISTERED", "WINDOW", "WINDOWS",
                                             "WARMUP", "WORKER_COUNT", "WORKER_CPU_REQUEST",
-                                            "ACTOR_MEMORY", "RAMP_START", "RAMP_MULT",
-                                            "APO_FLAGS")},
+                                            "ACTOR_MEMORY", "ACTOR_CPU", "RAMP_START",
+                                            "RAMP_MULT", "APO_FLAGS", "LIFECYCLE_MODE",
+                                            "TEMPLATE")},
   }
   if mode == "fine-ramp":
     lo, hi, step = fine_plan(env)
@@ -1558,7 +1738,7 @@ def main() -> int:
       write_json(os.path.join(results_dir, "node_oom.json"), oom)
       extra["node_oom_events"], extra["node_oom_other"] = oom["node_oom_events"], oom["node_oom_other"]
     for k, v in old.items():
-      if k not in extra and (k.startswith(("node_oom", "snapshot_plugin_", "atelet_", "sandbox_"))
+      if k not in extra and (k.startswith(("node_oom", "objectstore_plugin_", "atelet_", "sandbox_"))
                              or k in ("mem_per_actor_mib", "node_mem_used_gib", "sandbox_procs")):
         extra[k] = v
 

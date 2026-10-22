@@ -25,20 +25,31 @@ source "${APO_DIR}/set-env.sh" >/dev/null
 LOG="${RESULTS_DIR}/build_output.log"
 : > "${LOG}"
 
-# The allowed file scope (objective.md), as Go packages.
+# The allowed file scope (objective.md), as Go packages. Upstream renamed
+# cmd/ateom-* to cmd/ateworker-*, cmd/snapshot-plugin to cmd/objectstore-plugin,
+# internal/ateomnet to internal/ateworker/actornet + internal/netns and
+# internal/ateomcgroup to internal/ateworker/cgroup (see CHANGELOG 2026-10-22).
 PKGS=(
   ./pkg/objectstorage/...
   ./cmd/atelet/...
-  ./cmd/snapshot-plugin/...
-  ./cmd/ateom-gvisor/...
-  ./cmd/ateom-microvm/...
-  ./internal/ateomnet/...
-  ./internal/ateomcgroup/...
+  ./cmd/objectstore-plugin/...
+  ./cmd/ateworker-gvisor/...
+  ./cmd/ateworker-microvm/...
+  ./internal/ateworker/actornet/...
+  ./internal/ateworker/cgroup/...
+  ./internal/netns/...
   ./internal/tarutil/...
 )
-# Packages that don't exist on this base are skipped, not failed.
+# Lever branches only (ATE_APO_* switches); absent on the base.
+OPTIONAL_PKGS=(
+  ./internal/apoflag/...
+)
 EXISTING=()
+MISSING=()
 for p in "${PKGS[@]}"; do
+  if [ -d "${p%/...}" ]; then EXISTING+=("$p"); else MISSING+=("$p"); fi
+done
+for p in "${OPTIONAL_PKGS[@]}"; do
   [ -d "${p%/...}" ] && EXISTING+=("$p")
 done
 
@@ -56,6 +67,11 @@ EOF
   exit 1
 }
 
+if [ "${#MISSING[@]}" -gt 0 ]; then
+  echo "allowed-scope packages missing on this base: ${MISSING[*]}" >> "${LOG}"
+  fail "SCOPE_PACKAGE_MISSING" "allowed-scope packages missing: ${MISSING[*]} (update build.sh and objective.md)."
+fi
+
 echo ">>> go build" | tee -a "${LOG}"
 go build "${EXISTING[@]}" >> "${LOG}" 2>&1 || fail "COMPILE_FAILURE" "go build failed."
 
@@ -66,7 +82,7 @@ echo ">>> go test -short" | tee -a "${LOG}"
 if ! go test -short -count=1 "${EXISTING[@]}" >> "${LOG}" 2>&1; then
   # Retry only the failed packages once: a flake (e.g. cmd/atelet
   # TestSandboxAssetPrewarmDownloads under full parallel load) shouldn't DISCARD a trial.
-  FAILED=$(grep -E '^FAIL\s+github.com/' "${LOG}" | awk '{print $2}' | sort -u)
+  FAILED=$(grep -E '^FAIL\s+go\.ate\.dev/' "${LOG}" | awk '{print $2}' | sort -u)
   [ -n "${FAILED}" ] || fail "UNIT_TEST_FAILURE" "Unit tests failed."
   echo ">>> retrying failed packages once: ${FAILED}" | tee -a "${LOG}"
   # shellcheck disable=SC2086
@@ -100,5 +116,9 @@ if [ -z "${AGENTSIM_IMAGE:-}" ]; then
   fi
 fi
 
-echo "AGENTSIM_IMAGE=${AGENTSIM_IMAGE}" > "${RESULTS_DIR}/build_artifacts.env"
+{
+  echo "AGENTSIM_IMAGE=${AGENTSIM_IMAGE}"
+  echo "AGENTSIM_COMMIT=$(git -C "${AGENTS_TCO_DIR}" rev-parse HEAD)"
+  echo "AGENTSIM_BRANCH=$(git -C "${AGENTS_TCO_DIR}" rev-parse --abbrev-ref HEAD)"
+} > "${RESULTS_DIR}/build_artifacts.env"
 echo ">>> Build validation succeeded. Artifacts: ${RESULTS_DIR}/build_artifacts.env" | tee -a "${LOG}"

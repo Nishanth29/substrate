@@ -1,10 +1,16 @@
 # agentsim Job for one APO trial (rendered by run_experiment.py; placeholders
 # come from the trial env). Based on substrate-agents-tco/service/manifests/agent-sim.yaml
 # (swap mode, no autosuspender). Runs on the system pool, never the metal node.
+# It runs as ServiceAccount agent-sim/default; its podidentity SPIFFE ID
+# (AGENTSIM_SPIFFE_ID) is an ateapi bootstrap owner and on the router's
+# ingress allowlist (set-env.sh install settings).
 apiVersion: v1
 kind: Namespace
 metadata:
   name: agent-sim
+  labels:
+    # ate-system admits API clients only from namespaces with this label (#2522).
+    ate.dev/api-access: "true"
 ---
 apiVersion: batch/v1
 kind: Job

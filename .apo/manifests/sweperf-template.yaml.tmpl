@@ -1,0 +1,40 @@
+# The sweperf astropy-7336 ActorTemplate the harness creates (run_experiment.py
+# create_template), rendered with string.Template from tunables.env.
+#
+# Copied from upstream benchmarking/workloads/manifests/sweperf/generated/
+# sweperf-astropy-7336-template.yaml.tmpl (3e2797bc) with one change: the
+# resources come from ACTOR_CPU / ACTOR_MEMORY instead of upstream's fixed
+# 2 CPU / 4Gi. Upstream now requires actor cpu and memory limits (#2285) and
+# the scheduler books them against each worker's capacity, so 4Gi x AWAKE=500
+# does not fit one node. The defaults (1 CPU = 1 vCPU, 2Gi) mirror what the
+# old template got without limits (kata's default 2 GiB guest), so the
+# snapshot carries the same guest size as the Oct 11 campaign.
+metadata:
+  atespace: benchmark-workloads
+  name: ${TEMPLATE}
+workerSelector:
+  matchLabels:
+    workload: benchmark-worker
+containers:
+- name: astropy
+  # Built from https://github.com/gke-labs/sweperf c30c0d6 or later, pinned by
+  # digest because these images are rebuilt in place under the same tag.
+  image: "${SWEPERF_IMAGE}"
+  command:
+  - "python3"
+  - "/replay.py"
+  - "/trace.json"
+  env:
+  - name: SWEPERF_DISABLE_INTERNAL_SLEEP
+    value: "1"
+  - name: SWEPERF_TOTAL_STEPS
+    value: "21"
+resources:
+  limits:
+    cpuMillicores: ${ACTOR_CPU_MILLICORES}
+    memoryBytes: ${ACTOR_MEMORY_BYTES}
+snapshotConfig:
+  preferredFidelity: SNAPSHOT_FIDELITY_MEMORY
+  # Ignored without the PerTemplateSnapshotLocation preview gate: snapshots go
+  # under ate-api-server's --snapshot-location (SNAPSHOT_LOCATION, set-env.sh).
+  storageLocation: gs://${BUCKET_NAME}/benchmark-workloads/${TEMPLATE}/

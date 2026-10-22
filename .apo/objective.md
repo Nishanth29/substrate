@@ -30,14 +30,19 @@ optimization:
     # Worst per-window drain after the close (wakes outrunning the window); tune after v000.
     - metric: drain_s_max
       max: 5
+  # Upstream renames (2026-10-22 port): cmd/ateom-* -> cmd/ateworker-*,
+  # cmd/snapshot-plugin -> cmd/objectstore-plugin, internal/ateomnet ->
+  # internal/ateworker/actornet + internal/netns, internal/ateomcgroup ->
+  # internal/ateworker/cgroup. build.sh compiles/tests exactly these packages.
   allowed_file_scope: |
     pkg/objectstorage/**
     cmd/atelet/**
-    cmd/snapshot-plugin/**
-    cmd/ateom-gvisor/**
-    cmd/ateom-microvm/**
-    internal/ateomnet/**
-    internal/ateomcgroup/**
+    cmd/objectstore-plugin/**
+    cmd/ateworker-gvisor/**
+    cmd/ateworker-microvm/**
+    internal/ateworker/actornet/**
+    internal/ateworker/cgroup/**
+    internal/netns/**
     internal/tarutil/**
     !**/*_test.go
     !**/*.pb.go
@@ -58,12 +63,15 @@ suspend plus one resume (actor turnover), not memory swap.
 ## Workload
 
 - **Load generator:** agentsim swap mode (aditya-shantanu/substrate-agents-tco,
-  `--sweperf`): it keeps `AWAKE` actors resident and every 1-s tick parks k and
-  wakes k, so ResumeActor/s = SuspendActor/s = k per second. A wake is
-  `GET /health` through the router (no work in the actor). No script steps run
-  in the actors.
-- **Fleet:** `REGISTERED` sweperf actors (astropy-7336, 37 MB compressed / 61 MB
-  uncompressed snapshot), `AWAKE` of them active. A pre-warm pass runs one
+  branch `fine-ramp-ate-main`, `--sweperf`): it keeps `AWAKE` actors resident
+  and every 1-s tick parks k and wakes k, so ResumeActor/s = SuspendActor/s = k
+  per second. A park is `SuspendActor` with no options (`--lifecycle-mode
+  suspend`, explicit), which upstream completes asynchronously since #2805. A
+  wake is `GET /health` through the router, over mTLS on 443 with agentsim's
+  podidentity certificate (no work in the actor). No script steps run in the
+  actors.
+- **Fleet:** `REGISTERED` sweperf actors (template `sweperf-astropy-7336`,
+  1 vCPU / 2Gi guest: `ACTOR_CPU` / `ACTOR_MEMORY`), `AWAKE` of them active. A pre-warm pass runs one
   sweperf step in every actor and parks it, so every measured wake restores
   the actor's own snapshot (warm), not the template's golden snapshot.
 - **Rate:** a fixed rate `RATE` per second, 80% of this stack's v000 ceiling,
@@ -98,16 +106,19 @@ suspend plus one resume (actor turnover), not memory swap.
 - Reported for context, not optimized: cold-wake resume p90, warm-wake share,
   TTFE p50/p95 (accept; `ttfe_complete_*` as context), plugin and worker stage
   medians (restore prep, network, VMM or sandbox create, restore, teardown,
-  snapshot download and upload), pre-warm time, snapshot-plugin and atelet RSS
-  and peak RSS at the end of the run, and the spec view (resume and
+  snapshot download and upload, restores by snapshot kind: local vs
+  downloaded), pre-warm time, objectstore-plugin and atelet RSS and peak RSS
+  at the end of the run, and the spec view (resume and
   suspend p95 vs 500 ms, failures vs 5%, TTFE accept p95 vs 1 s).
 
 ## Allowed changes
 
-The node data plane on the activation path: the snapshot plugin and object
-storage (`pkg/objectstorage`, `cmd/snapshot-plugin`), atelet, the gVisor and
-microVM workers, worker networking (`internal/ateomnet`), cgroups and tar
-handling. The benchmark, the load generator, the cluster manifests and
+The node data plane on the activation path: the object-store plugin and object
+storage (`pkg/objectstorage`, `cmd/objectstore-plugin`), atelet, the gVisor and
+microVM workers (`cmd/ateworker-*`), worker networking
+(`internal/ateworker/actornet`, `internal/netns`), cgroups
+(`internal/ateworker/cgroup`) and tar handling. The per-actor credential code
+(`internal/objectstoreplugin`) stays out of scope. The benchmark, the load generator, the cluster manifests and
 `.apo/` are out of scope, so throughput can't be "improved" by changing the
 load or the hardware. The router's parked-request budget stays at its default:
 raising it turns refusals into slow resumes and only hides the problem.
@@ -115,19 +126,30 @@ raising it turns refusals into slow resumes and only hides the problem.
 Each winning change must be small and behind a flag or env knob, so it can
 become one upstream PR.
 
-## Where the time goes today (start here)
+## Base and baseline
 
-From the Oct 9 activation campaign (agents-tco, nano agents, same node type);
-the base build already has that campaign's patches (pooled GCS clients and
-buffers, 4 MiB x 12 download ranges, CRNG reseed retry, no tar fsync, gVisor
-netns pool, `--shared-root`, lean gVisor teardown):
+The base is plain upstream main `3e2797bc` (2026-10-22). It does **not**
+carry Aditya's patch set or the Study K env knobs of the old base
+(`d1b2371d` + patches); some of that work landed upstream in other forms
+(single-request GCS transfers spread over the connection pool #2719, sized
+zstd frames and pooled upload buffers #2835, no tar fsync #3026, async local
+snapshot uploads #2789, prefer the local snapshot on restore #2658, 60 s CRNG
+reseed #2743). Every number below is from the old base: re-measure `v000`
+(3 runs) and the stack's ramp ceiling before trusting `RATE` or the
+thresholds. Register the baseline with
+`apo hpo complete --hypothesis-id v000 --workspace . --results-dir .apo/results/raw/v000`.
+
+## Where the time went on the old base (start here)
+
+From the Oct 9 activation campaign (agents-tco, nano agents, same node type),
+on the old base with that campaign's patches:
 
 - **microVM** breaks at ~20/s with the CPUs ~35% busy: every per-VM step slows
   at once (tap setup 2 -> 1,300 ms, VM restore 140 -> 1,500, restore prep
   10 -> 1,000, teardown 230 -> 1,460). Candidates:
-  - `internal/ateomnet` / `cmd/ateom-microvm/net.go`: keep the tap with a
-    pooled network namespace (5-6 netlink round trips per tap today).
-  - `cmd/ateom-microvm` cleanup (`kata/cleanup_linux.go`): scans every
+  - `internal/ateworker/actornet` / `cmd/ateworker-microvm/net.go`: keep the
+    tap with a pooled network namespace (5-6 netlink round trips per tap).
+  - `cmd/ateworker-microvm` cleanup (`kata/cleanup_linux.go`): scans every
     `/proc/*/cmdline` and mountinfo 3 times per swap; skip when the actor's
     cgroup was killed cleanly.
   - drop the guest page cache before `vm.snapshot` (the 128 MiB image is
