@@ -435,6 +435,7 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	if err != nil {
 		return restoreGuestReadyError(ctx, "dialing kata-agent after resume", err)
 	}
+	tAgentDial := time.Now()
 	defer func() {
 		if retErr != nil {
 			_ = guestAC.Close()
@@ -467,14 +468,17 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	if err := wakeupprobe.WaitAll(ctx, containers, actornet.ActorVethIP, wakeupprobe.DialFunc(s.sandboxDialer(actorUID))); err != nil {
 		return fmt.Errorf("while waiting for container wakeup probe: %w", err)
 	}
+	tProbe := time.Now()
 
 	// Where a resume goes. Like the boot phases, this used to be a single total,
 	// which hid that a first (cold) restore and a later (warm) one differ by more
 	// than 5x on the same actor. upper/lowers is the host reassembling the rootfs;
 	// vm_restore is cloud-hypervisor reading guest RAM back; reseed is the kata-agent dial
-	// and the CRNG reseed, the head of wakeup_probe.
-	dWakeupProbe := time.Since(tResume)
-	dTotal := time.Since(tStart)
+	// and the CRNG reseed, the head of wakeup_probe. agent_dial, reseed_rpc and probe
+	// split wakeup_probe into the dial, the ReseedRandomDev call alone and the
+	// containers' wakeup probes (see wakeupPhases).
+	dWakeupProbe := tProbe.Sub(tResume)
+	dTotal := tProbe.Sub(tStart)
 	slog.InfoContext(ctx, "Actor restore phases", slog.String("id", actorUID),
 		slog.Duration("prep", tPrep.Sub(tStart)),
 		slog.Duration("bundles", tBundles.Sub(tPrep)),
@@ -487,23 +491,27 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 		slog.Duration("resume", tResume.Sub(tVMRestore)),
 		slog.Duration("reseed", tReseeded.Sub(tResume)),
 		slog.Duration("wakeup_probe", dWakeupProbe),
+		slog.Duration("agent_dial", tAgentDial.Sub(tResume)),
+		slog.Duration("reseed_rpc", tReseeded.Sub(tAgentDial)),
+		slog.Duration("probe", tProbe.Sub(tReseeded)),
 		slog.Duration("total", dTotal))
 	// The joinable per-actor record the benchmarking tooling aggregates. The
 	// durable delta is not carried: tDurable is pinned to tLowers today, so it
 	// would always be the zero a record skips.
+	phases := []phaselog.Phase{
+		{Name: phasePrep, D: tPrep.Sub(tStart)},
+		{Name: phaseBundles, D: tBundles.Sub(tPrep)},
+		{Name: phaseUpperJoin, D: tUpper.Sub(tBundles)},
+		{Name: phaseLowers, D: tLowers.Sub(tUpper)},
+		{Name: phaseTap, D: tTap.Sub(tDurable)},
+		{Name: phaseVMMLaunch, D: tLaunch.Sub(tTap)},
+		{Name: phaseVMRestore, D: tVMRestore.Sub(tLaunch)},
+		{Name: phaseResume, D: tResume.Sub(tVMRestore)},
+	}
+	phases = append(phases, wakeupPhases(tResume, tAgentDial, tReseeded, tProbe)...)
+	phases = append(phases, phaselog.Phase{Name: phaseTotal, D: dTotal})
 	phaselog.LogSnapshotPhases(ctx, "Restore timing breakdown", p.actorAttribution(), scope,
-		phaselog.RestoreDurationKey, nil, []phaselog.Phase{
-			{Name: phasePrep, D: tPrep.Sub(tStart)},
-			{Name: phaseBundles, D: tBundles.Sub(tPrep)},
-			{Name: phaseUpperJoin, D: tUpper.Sub(tBundles)},
-			{Name: phaseLowers, D: tLowers.Sub(tUpper)},
-			{Name: phaseTap, D: tTap.Sub(tDurable)},
-			{Name: phaseVMMLaunch, D: tLaunch.Sub(tTap)},
-			{Name: phaseVMRestore, D: tVMRestore.Sub(tLaunch)},
-			{Name: phaseResume, D: tResume.Sub(tVMRestore)},
-			{Name: phaseWakeupProbe, D: dWakeupProbe},
-			{Name: phaseTotal, D: dTotal},
-		})
+		phaselog.RestoreDurationKey, nil, phases)
 
 	ra := &runningActor{
 		chProc: chProc, vfsdProc: vfsdProc,

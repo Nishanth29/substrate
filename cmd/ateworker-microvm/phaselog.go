@@ -16,7 +16,12 @@
 
 package main
 
-import "go.ate.dev/substrate/internal/ateattr"
+import (
+	"time"
+
+	"go.ate.dev/substrate/internal/ateattr"
+	"go.ate.dev/substrate/internal/ateworker/phaselog"
+)
 
 // The phase names, suffixed onto the phaselog duration keys. Kept out of
 // ateattr on purpose: that package's SnapshotPhase* values are the
@@ -26,7 +31,8 @@ import "go.ate.dev/substrate/internal/ateattr"
 // Checkpoint: snapshot, durable_dir and rootfs_upper run concurrently on the
 // paused guest, so the paused window costs their max, not their sum; prep,
 // pause and teardown are sequential around them. Restore: every phase is
-// sequential and the phases partition the total.
+// sequential and the phases partition the total, except agent_dial, reseed_rpc
+// and probe, which partition wakeup_probe and are logged alongside it.
 const (
 	phasePause       = "pause"
 	phaseSnapshot    = "snapshot"
@@ -43,6 +49,21 @@ const (
 	phaseVMRestore   = "vm_restore"
 	phaseResume      = "resume"
 	phaseWakeupProbe = "wakeup_probe"
+	phaseAgentDial   = "agent_dial"
+	phaseReseedRPC   = "reseed_rpc"
+	phaseProbe       = "probe"
 
 	phaseTotal = ateattr.SnapshotPhaseTotal
 )
+
+// wakeupPhases returns the wakeup_probe phase (resume until every container's
+// wakeup probe passed) followed by the three it consists of: the kata-agent
+// dial, the guest CRNG ReseedRandomDev call alone, and the wakeup probes.
+func wakeupPhases(tResume, tAgentDial, tReseeded, tProbe time.Time) []phaselog.Phase {
+	return []phaselog.Phase{
+		{Name: phaseWakeupProbe, D: tProbe.Sub(tResume)},
+		{Name: phaseAgentDial, D: tAgentDial.Sub(tResume)},
+		{Name: phaseReseedRPC, D: tReseeded.Sub(tAgentDial)},
+		{Name: phaseProbe, D: tProbe.Sub(tReseeded)},
+	}
+}
