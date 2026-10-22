@@ -38,6 +38,7 @@ import (
 	"go.ate.dev/substrate/internal/actorlock"
 	"go.ate.dev/substrate/internal/actorlog"
 	"go.ate.dev/substrate/internal/apierror"
+	"go.ate.dev/substrate/internal/apoflag"
 	"go.ate.dev/substrate/internal/ateinterceptors"
 	"go.ate.dev/substrate/internal/ateworker/actornet"
 	"go.ate.dev/substrate/internal/ateworker/cgroup"
@@ -130,6 +131,9 @@ func do(ctx context.Context) error {
 	}
 
 	slog.InfoContext(ctx, "ateworker booting", slog.String("version", version.Version))
+	// Workers start after the benchmark harness wrote the APO lever switches, so one
+	// read is enough. With none set, every lever is off and behaviour is unchanged.
+	apoflag.Init(ctx)
 	if *maxActors < 0 {
 		return fmt.Errorf("--max-actors must not be negative, got %d", *maxActors)
 	}
