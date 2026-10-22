@@ -1520,7 +1520,8 @@ def provenance_static(env: Dict[str, str], mode: str, trial_id: str) -> Dict:
       "agentsim_dirty": bool(git_out(tco, "status", "--porcelain", "--untracked-files=no", "--",
                                      "service")) if tco else False,
       "agentsim_image": env.get("AGENTSIM_IMAGE", ""),
-      "stack_id": env.get("ID") or f"stack-{env.get('SANDBOX_CLASS', 'gvisor')}",
+      # The engine's stack.env exports every stacks.json key but `id`, hence stack_id there.
+      "stack_id": env.get("STACK_ID") or f"stack-{env.get('SANDBOX_CLASS', 'gvisor')}",
       "cluster": env.get("CLUSTER_NAME", ""), "kubectl_context": env.get("KUBECTL_CONTEXT", ""),
       "sandbox_class": env.get("SANDBOX_CLASS", ""), "worker_node_pool": env.get("WORKER_NODE_POOL", ""),
       "bucket": env.get("BUCKET_NAME", ""),
@@ -1564,9 +1565,36 @@ def write_json(path: str, data: dict) -> None:
     f.write("\n")
 
 
+def run_metadata(env: Dict[str, str], mode: str) -> Dict:
+  """Non-metric context for summary.json's `metadata` block (the engine reads only
+  `metrics`), so runs can be compared: lifecycle and durability mode, code and stack."""
+  return {
+      "mode": mode,
+      # agentsim --lifecycle-mode: suspend = SuspendActor with no suspend_options, which
+      # upstream completes asynchronously since #2805 (the durable upload finishes in the
+      # background); pause was removed upstream (#2813).
+      "lifecycle_mode": env.get("LIFECYCLE_MODE", "suspend"),
+      "suspend_durability": "upstream default (asynchronous, #2805; no suspend_options)",
+      "workspace_head": PROVENANCE.get("workspace_head") or git_out(ROOT, "rev-parse", "HEAD"),
+      "upstream_base": git_out(ROOT, "merge-base", "HEAD", "upstream/main"),
+      "agentsim_commit": env.get("AGENTSIM_COMMIT") or PROVENANCE.get("agentsim_commit", ""),
+      "agentsim_branch": env.get("AGENTSIM_BRANCH", ""),
+      "agentsim_image": env.get("AGENTSIM_IMAGE", ""),
+      "stack_id": PROVENANCE.get("stack_id", ""), "cluster": env.get("CLUSTER_NAME", ""),
+      "sandbox_class": env.get("SANDBOX_CLASS", ""),
+      "hardware_type": env.get("HARDWARE_TYPE", ""),
+      "template": env.get("TEMPLATE", ""), "actor_cpu": env.get("ACTOR_CPU", "1"),
+      "actor_memory": env.get("ACTOR_MEMORY", ""), "router_url": env.get("ROUTER_URL", ""),
+      "snapshot_location": env.get("SNAPSHOT_LOCATION", ""),
+      "apo_flags": env.get("APO_FLAGS", ""),
+  }
+
+
 def error(results_dir: str, phase: str, message: str) -> int:
+  # The gke_apo engine reads `reason` (then `message`) as the crash reason.
   write_json(os.path.join(results_dir, "error.json"),
-             {"phase": phase, "error_type": "BENCHMARK_FAILURE", "message": message})
+             {"status": "FAILED", "phase": phase, "error_type": "BENCHMARK_FAILURE",
+              "reason": f"{phase}: {message}", "message": message})
   log(f"FAILED [{phase}]: {message}")
   return 1
 
@@ -1762,7 +1790,8 @@ def main() -> int:
   extra.update(stall_metrics)
   rate = float(env["RATE"]) if args.mode == "fixed" else 0.0
   metrics = summarize(result, breakdown, extra, args.mode, rate)
-  write_json(os.path.join(results_dir, "summary.json"), {"metrics": metrics})
+  write_json(os.path.join(results_dir, "summary.json"),
+             {"metrics": metrics, "metadata": run_metadata(env, args.mode)})
   if args.mode in ("ramp", "fine-ramp"):
     write_json(os.path.join(results_dir, "levels.json"), {"levels": level_rows(result)})
   write_monitor(results_dir, breakdown, metrics)

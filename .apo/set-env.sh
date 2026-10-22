@@ -22,14 +22,19 @@ if ! python3 -c "import yaml" &>/dev/null; then
 fi
 
 # --- Leased stack -------------------------------------------------------------
-# The engine writes stack.env at the worktree root (stack_leases.write_stack_env)
-# with the stacks.json keys uppercased. .apo/stack.env is accepted for manual runs.
+# The engine writes stack.env at the trial worktree ROOT
+# (StackLeases.write_stack_env: every stacks.json key uppercased, CLUSTER_NAME
+# from cluster_name, id not exported). .apo/stack.env is accepted for manual runs.
 for f in "${WORKLOAD_ROOT}/stack.env" "${SCRIPT_DIR}/stack.env"; do
   if [ -f "$f" ]; then
     source "$f"
     break
   fi
 done
+# stacks.json carries both the engine's `zone` and our `compute_zone`.
+if [ -z "${COMPUTE_ZONE:-}" ] && [ -n "${ZONE:-}" ]; then
+  export COMPUTE_ZONE="${ZONE}"
+fi
 
 export SCRATCH_DIR="${SCRIPT_DIR}/scratch"
 mkdir -p "${SCRATCH_DIR}"

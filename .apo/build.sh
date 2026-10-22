@@ -56,10 +56,13 @@ done
 fail() {
   local error_type="$1" message="$2"
   cat "${LOG}" >&2 || true
+  # The gke_apo engine reads `reason` (then `message`); phase/error_type are ours.
   cat > "${RESULTS_DIR}/error.json" <<EOF
 {
+  "status": "FAILED",
   "phase": "PREFLIGHT_BUILD",
   "error_type": "${error_type}",
+  "reason": "PREFLIGHT_BUILD ${error_type}: ${message} See build_output.log.",
   "message": "${message} See build_output.log."
 }
 EOF

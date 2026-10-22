@@ -146,3 +146,34 @@ was checked against the code:
 - RATE=3 (microvm) is provisional, from the old base: re-derive it from a v000
   ramp on this base.
 
+## [2026-10-22T03:52:00Z] [ENGINE_CONTRACT]
+
+Aligned .apo/ with the gke_apo engine as implemented (src/apo, not only the
+README, which disagrees with the code in places):
+
+- stacks.json: `{"stacks": [{"id": ...}]}` is the only shape the loader
+  accepts; status in stacks.json is not used for scheduling and there is no
+  disabled status (only `draining` in results/state.json). stack-microvm is the
+  only entry in `stacks`; stack-gvisor (apo-gvisor, stocked out) moved to a
+  `disabled_stacks` list the engine never reads. Entries carry the engine's
+  `zone` and our `compute_zone`/`compute_region`/`project_id`, plus `stack_id`
+  (the engine does not export `id` to stack.env). Values avoid `"`/`$`, since
+  stack.env is written unescaped.
+- stack.env: the engine writes it at the trial worktree root (every key
+  uppercased); set-env.sh sources `<root>/stack.env`, then `.apo/stack.env`,
+  and maps ZONE to COMPUTE_ZONE. build.sh and run_experiment.sh source
+  set-env.sh themselves, since the merge gate and the evolve evaluator run them
+  without it.
+- summary.json: `{"metrics": {flat numbers}, "metadata": {...}}`; the engine
+  reads only `metrics`, metadata records lifecycle/durability mode, agentsim
+  commit/branch/image, workspace head and upstream base, stack, template and
+  actor limits.
+- error.json: adds `reason` (what the engine reads, then `message`) and
+  `status: FAILED`; phase/error_type stay for us.
+- objective.md frontmatter passes the ObjectiveParser rules (thresholds stay
+  placeholders until the v000 3-run CV). Baseline: run
+  `.apo/run_experiment.sh .apo/results/raw/v000`, then
+  `apo hpo complete --hypothesis-id v000 --workspace . --results-dir .apo/results/raw/v000`
+  (the Optuna DB is .apo/optuna_study.db; `orchestrator init` also seeds v000
+  if that dir exists).
+

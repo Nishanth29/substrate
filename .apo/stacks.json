@@ -2,8 +2,10 @@
   "stacks": [
     {
       "id": "stack-microvm",
+      "stack_id": "stack-microvm",
       "cluster_name": "substrate-metal",
       "project_id": "nishanth-gke-dev",
+      "zone": "us-east4-c",
       "compute_zone": "us-east4-c",
       "compute_region": "us-east4",
       "hardware_type": "c3-highmem-192-metal",
@@ -12,21 +14,23 @@
       "bucket_name": "snapshot-substrate-metal-nishanth-gke-dev",
       "status": "IDLE",
       "worker_node_taint": "ate.dev/sandboxClass=microvm:NoSchedule",
-      "note": "c3-standard-192-metal stocked out in us-east4-c on Oct 11, 2026; using the existing c3-highmem-192-metal pool microvm-metal (tainted)."
-    },
+      "note": "c3-standard-192-metal stocked out in us-east4-c on Oct 11 2026; uses the existing c3-highmem-192-metal pool microvm-metal (tainted). Only active stack."
+    }
+  ],
+  "disabled_stacks": [
     {
       "id": "stack-gvisor",
+      "disabled_reason": "apo-gvisor is stocked out (c3-highmem-192-metal, us-central1-a) as of Oct 22 2026. The engine only reads stacks, so this entry is never leased; move it back into stacks to re-enable it (after porting its tunables to the new base).",
       "cluster_name": "apo-gvisor",
       "project_id": "nishanth-gke-dev",
+      "zone": "us-central1-a",
       "compute_zone": "us-central1-a",
       "compute_region": "us-central1",
       "hardware_type": "c3-highmem-192-metal",
       "sandbox_class": "gvisor",
       "worker_node_pool": "apo-metal",
       "bucket_name": "snapshot-apo-gvisor-nishanth-gke-dev",
-      "status": "IDLE",
-      "worker_node_taint": "ate.dev/sandboxClass=gvisor:NoSchedule",
-      "note": "c3-standard-192-metal is not offered in us-central1-c; us-central1-a is the only us-central1 zone with it (checked Oct 11, 2026). Uses c3-highmem-192-metal (also offered in us-central1-a) so both stacks run on identical hardware (stack-microvm fell back to it after a c3-standard-192-metal stockout)."
+      "worker_node_taint": "ate.dev/sandboxClass=gvisor:NoSchedule"
     }
   ]
 }
