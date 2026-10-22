@@ -459,7 +459,26 @@ func (s *AteWorkerService) restoreMemoryFidelity(ctx context.Context, p actorBoo
 	// and notifies the guest before unpausing the vCPUs, so a >=5.18 kernel reseeds its
 	// CRNG on its own with no host round-trip, no per-restore RPC, and no post-Resume
 	// race. At that point this agent-driven reseed can be dropped.
-	if err := reseedGuestCRNG(ctx, guestAC); err != nil {
+	reseed := func() error { return reseedGuestCRNG(ctx, guestAC) }
+	if useFastReseed() {
+		// APO lever A (see reseed_fast.go): bounded attempts, each after the first
+		// on a fresh agent connection, within reseedBudget.
+		reseed = func() error {
+			nonce, err := newReseedNonce()
+			if err != nil {
+				return err
+			}
+			dial := func(c context.Context) (agentReseeder, error) {
+				ac, err := dialAgentRetry(c, kata.VsockSocketPath(actorUID), reseedAttemptTimeout)
+				if err != nil {
+					return nil, err
+				}
+				return ac, nil
+			}
+			return reseedGuestCRNGFast(ctx, guestAC, dial, nonce, reseedAttemptTimeout, reseedBudget)
+		}
+	}
+	if err := reseed(); err != nil {
 		return restoreGuestReadyError(ctx, "reseeding guest CRNG", err)
 	}
 	tReseeded := time.Now()
