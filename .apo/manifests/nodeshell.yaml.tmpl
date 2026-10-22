@@ -1,0 +1,27 @@
+# Privileged node shell on the stack's metal node, used by run_experiment.py to
+# apply node knobs (tmpfs for the actor directory, neighbour-table sysctls) and
+# to read node state. Same approach as the agents-tco campaign's nodeshell.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: apo-nodeshell
+  namespace: kube-system
+  labels: { app: apo-nodeshell }
+spec:
+  hostPID: true
+  hostNetwork: true
+  nodeSelector: { cloud.google.com/gke-nodepool: "${WORKER_NODE_POOL}" }
+  tolerations:
+  - operator: Exists
+  containers:
+  - name: shell
+    image: debian:bookworm-slim
+    command: ["sleep", "infinity"]
+    securityContext: { privileged: true }
+    volumeMounts:
+    - { name: host, mountPath: /host }
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+  volumes:
+  - name: host
+    hostPath: { path: / }

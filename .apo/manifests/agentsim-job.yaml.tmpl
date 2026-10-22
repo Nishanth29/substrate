@@ -1,0 +1,55 @@
+# agentsim Job for one APO trial (rendered by run_experiment.py; placeholders
+# come from the trial env). Based on substrate-agents-tco/service/manifests/agent-sim.yaml
+# (swap mode, no autosuspender). Runs on the system pool, never the metal node.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-sim
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: agent-sim
+  labels: { app: agentsim, apo-trial: "${TRIAL_ID}" }
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: ${JOB_DEADLINE_S}
+  template:
+    metadata:
+      labels: { app: agentsim, apo-trial: "${TRIAL_ID}" }
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - { key: cloud.google.com/gke-nodepool, operator: NotIn, values: ["${WORKER_NODE_POOL}"] }
+      containers:
+      - name: agentsim
+        image: ${AGENTSIM_IMAGE}
+        args: ${AGENTSIM_ARGS}
+        volumeMounts:
+        - { name: servicedns-ca, mountPath: /run/servicedns-ca, readOnly: true }
+        - { name: podidentity, mountPath: /run/podidentity.podcert.ate.dev, readOnly: true }
+        resources:
+          # At 20+/s the sim keeps hundreds of requests in flight; give it room.
+          requests: { cpu: "2", memory: 1Gi }
+          limits: { cpu: "6", memory: 4Gi }
+      volumes:
+      - name: servicedns-ca
+        projected:
+          sources:
+          - clusterTrustBundle:
+              signerName: servicedns.podcert.ate.dev/identity
+              labelSelector:
+                matchLabels: { podcert.ate.dev/canarying: live }
+              path: ca.crt
+      - name: podidentity
+        projected:
+          sources:
+          - podCertificate:
+              signerName: podidentity.podcert.ate.dev/identity
+              keyType: ECDSAP256
+              credentialBundlePath: credential-bundle.pem

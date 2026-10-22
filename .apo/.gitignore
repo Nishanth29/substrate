@@ -1,0 +1,20 @@
+# Local environments & credentials
+.gcloud-config*/
+.kubeconfig*
+scratch/
+tmp/
+.worktrees/
+.worktree/
+.venv/
+**/.venv
+__pycache__/
+*.pyc
+optuna_study.db*
+stack*.env
+
+# Trial results, logs, reports and WorkQueue state: run artifacts, never tracked.
+results/
+validate_report.json
+*.test
+*.pprof
+*.pid

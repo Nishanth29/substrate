@@ -1,0 +1,7 @@
+{
+  "exclude_constraints": ["drain_s_max"],
+  "constraint_overrides": {
+    "error_refusal_pct": {"max": 5},
+    "backlog_growth_excess": {"max": 4}
+  }
+}
