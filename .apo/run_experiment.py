@@ -490,6 +490,41 @@ def apply_storage_knobs(env: Dict[str, str]) -> Dict[str, str]:
   return {n: env.get(n, "") for n in names}
 
 
+# atelet flags the harness may set as locked tunables (env var -> flag). Empty or
+# unset leaves the flag out, so atelet uses the upstream default. install()
+# redeploys atelet from the manifest on every trial, which drops any earlier value.
+ATELET_FLAG_TUNABLES = {
+    # How long a suspended actor's latest snapshot stays on the node before atelet
+    # detaches it (upstream default 30m, #2733). A short value makes most wakes
+    # download from GCS (the Phase 1 "gcs" arm); unset = node-local restores.
+    "ATELET_SNAPSHOT_DETACH_DELAY": "--snapshot-detach-delay",
+}
+
+
+def atelet_ds_name(env: Dict[str, str]) -> str:
+  names = kubectl(env, "-n", "ate-system", "get", "ds", "-o", "name", capture_output=True,
+            text=True).stdout.split()
+  return next(d for d in names if d.split("/")[-1].startswith("atelet"))
+
+
+def apply_atelet_flags(env: Dict[str, str]) -> Dict[str, str]:
+  """Sets ATELET_FLAG_TUNABLES on the atelet container (workers at 0); returns them."""
+  want = {flag: env.get(var, "").strip() for var, flag in ATELET_FLAG_TUNABLES.items()}
+  ds = atelet_ds_name(env)
+  got = json.loads(kubectl(env, "-n", "ate-system", "get", ds, "-o", "json",
+                     capture_output=True, text=True).stdout)
+  containers = got["spec"]["template"]["spec"]["containers"]
+  idx = next(i for i, c in enumerate(containers) if c.get("name") == "atelet")
+  old = containers[idx].get("args") or []
+  args = [a for a in old if not any(a.startswith(f + "=") for f in want)]
+  args += [f"{f}={v}" for f, v in want.items() if v]
+  if args != old:
+    kubectl(env, "-n", "ate-system", "patch", ds, "--type=json", "-p", json.dumps(
+        [{"op": "replace", "path": f"/spec/template/spec/containers/{idx}/args", "value": args}]))
+    kubectl(env, "-n", "ate-system", "rollout", "status", ds, "--timeout=10m")
+  return {var: env.get(var, "") or "upstream-default" for var in ATELET_FLAG_TUNABLES}
+
+
 # --- Fleet --------------------------------------------------------------------
 
 
@@ -1191,6 +1226,7 @@ echo actor_entries=$(find /var/lib/ate/actors -mindepth 1 2>/dev/null | wc -l)
 echo actor_kb=$( (du -sxk /var/lib/ate/actors 2>/dev/null || echo 0) | cut -f1)
 echo snapshot_dirs=$(find /var/lib/ate/snapshots -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
 echo snapshot_kb=$( (du -sxk /var/lib/ate/snapshots 2>/dev/null || echo 0) | cut -f1)
+echo disk_avail_kb=$(df -Pk /var/lib/ate 2>/dev/null | awk 'NR==2{{print $4}}')
 n=0
 for p in /proc/[0-9]*; do e=$(readlink $p/exe 2>/dev/null)
   case "${{e##*/}}" in {_RUNTIME_PROCS}) n=$((n + 1));; esac; done
@@ -1211,7 +1247,7 @@ sleep 2
 for f in /run/netns/worker-actor:*; do [ -e "$f" ] && {{ umount "$f"; rm -f "$f"; }}; done
 find /sys/fs/cgroup -mindepth 1 -depth -type d -regextype posix-extended \\
   -regex '{_ATE_CGROUP_RE}' -exec rmdir {{}} \\;
-for d in /var/lib/ate/actors/*; do [ -e "$d" ] || continue
+for d in /var/lib/ate/actors/* /var/lib/ate/snapshots/*; do [ -e "$d" ] || continue
   case " $KEEP " in *" ${{d##*/}} "*) ;; *) rm -rf --one-file-system "$d";; esac; done
 true
 """
@@ -1221,7 +1257,10 @@ true
 # churn, so they are reported as leaked_* context only.
 LEAK_KEYS = ("cgroups_ate", "netns_actor", "links_tap_veth", "mounts_actors", "processes")
 # Left over from earlier trials; cleaned before the next one.
-RESIDUE_KEYS = ("cgroups_ate", "netns_actor", "processes", "mounts_actors", "actor_entries")
+# snapshot_dirs: atelet keeps a suspended actor's latest snapshot under /var/lib/ate/snapshots
+# for --snapshot-detach-delay (30 min, upstream #2733); purged actors' copies only fill the disk.
+RESIDUE_KEYS = ("cgroups_ate", "netns_actor", "processes", "mounts_actors", "actor_entries",
+                "snapshot_dirs")
 # Residue still there after a clean means the node needs recycling (never automatic).
 NODE_RESIDUE_MAX = 5
 
@@ -1253,7 +1292,7 @@ def parse_node_snapshot(text: str) -> Optional[Dict[str, int]]:
 
 def residue_objects(snap: Dict[str, int]) -> int:
   """Our objects on an idle node (actor dirs not counted: plain files)."""
-  return sum(snap.get(k, 0) for k in RESIDUE_KEYS if k != "actor_entries")
+  return sum(snap.get(k, 0) for k in RESIDUE_KEYS if k not in ("actor_entries", "snapshot_dirs"))
 
 
 def leak_metrics(before: Dict[str, int], after: Dict[str, int]) -> Dict[str, int]:
@@ -1304,6 +1343,32 @@ def parse_node_rss(text: str) -> Dict[str, float]:
   return out
 
 
+NODE_DISK_SH = """\
+echo "local_snapshots $(find /var/lib/ate/snapshots -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+echo "local_snapshot_kb $( (du -sxk /var/lib/ate/snapshots 2>/dev/null || echo 0) | cut -f1)"
+df -Pk /var/lib/ate | awk 'NR==2{print "disk_used_kb", $3; print "disk_size_kb", $2}'
+"""
+
+
+def node_disk(env: Dict[str, str]) -> Dict[str, float]:
+  """Node-local snapshot footprint at the end of the run (before cleanup), context only."""
+  vals = {}
+  for line in node_sh(env, host_sh(NODE_DISK_SH), check=False).splitlines():
+    parts = line.split()
+    if len(parts) == 2 and parts[1].isdigit():
+      vals[parts[0]] = int(parts[1])
+  out: Dict[str, float] = {}
+  if "local_snapshots" in vals:
+    out["node_local_snapshots"] = vals["local_snapshots"]
+    out["node_local_snapshot_gib"] = round(vals.get("local_snapshot_kb", 0) / 1048576, 2)
+    if vals["local_snapshots"]:
+      out["local_snapshot_mb_per_actor"] = round(
+          vals.get("local_snapshot_kb", 0) / 1024 / vals["local_snapshots"], 1)
+  if vals.get("disk_size_kb"):
+    out["node_disk_used_pct"] = round(100 * vals.get("disk_used_kb", 0) / vals["disk_size_kb"], 1)
+  return out
+
+
 def node_rss(env: Dict[str, str]) -> Dict[str, float]:
   return parse_node_rss(node_sh(env, host_sh(NODE_RSS_SH), check=False))
 
@@ -1335,6 +1400,31 @@ def clean_node_residue(env: Dict[str, str], leak: Dict) -> None:
     raise LeakCheckError(
         f"{residue_objects(cleaned)} objects left on the node after cleaning "
         f"({', '.join(f'{k}={cleaned.get(k)}' for k in RESIDUE_KEYS)}); recycle the node")
+
+
+class DiskError(Exception):
+  """The node's /var/lib/ate disk can't hold the fleet's local snapshots."""
+
+
+def check_node_disk(env: Dict[str, str], leak: Dict) -> None:
+  """Fails fast when REGISTERED local snapshots won't fit the node disk.
+
+  Upstream atelet keeps every suspended actor's latest snapshot on the node for
+  --snapshot-detach-delay (30 min), so on one node the whole fleet's snapshots
+  are local at once (~133 MB each for the 2Gi sweperf guest). Filling the disk
+  gets the workers, atelet and the node shell evicted (2026-10-22 smoke #1).
+  """
+  avail_kb = (leak.get("start_after_clean") or leak.get("start") or {}).get("disk_avail_kb")
+  if not avail_kb:
+    return
+  need_mb = int(env["REGISTERED"]) * int(env.get("SNAPSHOT_MB_PER_ACTOR", "140"))
+  # Keep the kubelet's eviction threshold (~10% of the disk) and the image cache free.
+  usable_mb = avail_kb // 1024 - int(env.get("NODE_DISK_RESERVE_MB", "30000"))
+  leak["disk_need_mb"], leak["disk_usable_mb"] = need_mb, usable_mb
+  if need_mb > usable_mb:
+    raise DiskError(f"{env['REGISTERED']} actors x {env.get('SNAPSHOT_MB_PER_ACTOR', '140')} MB of "
+                    f"local snapshots = {need_mb} MB > {usable_mb} MB usable on the node's "
+                    "/var/lib/ate; lower REGISTERED or shorten atelet --snapshot-detach-delay")
 
 
 # --- Summary ------------------------------------------------------------------
@@ -1529,7 +1619,7 @@ def provenance_static(env: Dict[str, str], mode: str, trial_id: str) -> Dict:
                                             "WARMUP", "WORKER_COUNT", "WORKER_CPU_REQUEST",
                                             "ACTOR_MEMORY", "ACTOR_CPU", "RAMP_START",
                                             "RAMP_MULT", "APO_FLAGS", "LIFECYCLE_MODE",
-                                            "TEMPLATE")},
+                                            "TEMPLATE", "ATELET_SNAPSHOT_DETACH_DELAY")},
   }
   if mode == "fine-ramp":
     lo, hi, step = fine_plan(env)
@@ -1587,6 +1677,10 @@ def run_metadata(env: Dict[str, str], mode: str) -> Dict:
       "actor_memory": env.get("ACTOR_MEMORY", ""), "router_url": env.get("ROUTER_URL", ""),
       "snapshot_location": env.get("SNAPSHOT_LOCATION", ""),
       "apo_flags": env.get("APO_FLAGS", ""),
+      # Where warm wakes restore from depends on this (see restores_kind_* metrics).
+      "atelet_snapshot_detach_delay": env.get("ATELET_SNAPSHOT_DETACH_DELAY") or
+                                      "upstream default (30m)",
+      "registered": env.get("REGISTERED", ""), "awake": env.get("AWAKE", ""),
   }
 
 
@@ -1662,7 +1756,8 @@ def main() -> int:
         scale_workers(env, 0)
         purge_actors(env)
         clean_node_residue(env, leak)  # what earlier trials left, workers at 0
-        knobs = {**apply_node_knobs(env), **apply_storage_knobs(env)}
+        check_node_disk(env, leak)
+        knobs = {**apply_node_knobs(env), **apply_storage_knobs(env), **apply_atelet_flags(env)}
         write_json(os.path.join(results_dir, "knobs.json"), knobs)  # strings, not metrics
         leak["before"] = node_snapshot(env)
         leak["raw_before"] = LAST_SNAPSHOT_RAW["text"]
@@ -1680,6 +1775,8 @@ def main() -> int:
         return error(results_dir, "PREFLIGHT_CONTEXT", str(e))
       except LeakCheckError as e:
         return error(results_dir, "LEAK_CHECK", str(e))
+      except DiskError as e:
+        return error(results_dir, "PREFLIGHT_DISK", str(e))
       except WorkersNotRegistered as e:
         return error(results_dir, "WORKERS_REGISTER", str(e))
       except subprocess.CalledProcessError as e:
@@ -1710,6 +1807,10 @@ def main() -> int:
           extra["mem_per_actor_mib"] = round(extra["sandbox_rss_mib"] / int(env["AWAKE"]), 1)
       except Exception as e:  # pylint: disable=broad-except
         log(f"daemon RSS not read: {type(e).__name__}: {e}")  # context only
+      try:
+        extra.update(node_disk(env))  # local snapshots kept by atelet, before cleanup
+      except Exception as e:  # pylint: disable=broad-except
+        log(f"node disk not read: {type(e).__name__}: {e}")  # context only
     finally:
       if trial_logs:
         trial_logs.stop()  # a run that failed before collect_breakdown
@@ -1767,7 +1868,8 @@ def main() -> int:
       extra["node_oom_events"], extra["node_oom_other"] = oom["node_oom_events"], oom["node_oom_other"]
     for k, v in old.items():
       if k not in extra and (k.startswith(("node_oom", "objectstore_plugin_", "atelet_", "sandbox_"))
-                             or k in ("mem_per_actor_mib", "node_mem_used_gib", "sandbox_procs")):
+                             or k in ("mem_per_actor_mib", "node_mem_used_gib", "sandbox_procs")
+                             or k.startswith(("node_local_snapshot", "local_snapshot_", "node_disk_"))):
         extra[k] = v
 
   if not os.path.exists(log_path):

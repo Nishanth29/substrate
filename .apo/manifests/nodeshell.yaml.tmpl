@@ -9,6 +9,9 @@ metadata:
   labels: { app: apo-nodeshell }
 spec:
   hostPID: true
+  # Admitted (and evicted last) under node DiskPressure, so the harness can
+  # still read and clean the node when local snapshots fill its disk.
+  priorityClassName: system-node-critical
   hostNetwork: true
   nodeSelector: { cloud.google.com/gke-nodepool: "${WORKER_NODE_POOL}" }
   tolerations:
